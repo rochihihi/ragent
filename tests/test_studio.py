@@ -68,6 +68,8 @@ def test_context_limit_uses_selected_model() -> None:
     assert context_limit_for_model("deepseek", "deepseek-v4-pro") == 1_000_000
     for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
         assert context_limit_for_model("openai", model) == 1_050_000
+    assert context_limit_for_model("openai_official", "gpt-6-luna") == 1_050_000
+    assert context_limit_for_model("openai", "gpt-6-luna") == 1_050_000
     assert context_limit_for_model("openai", "unknown-proxy-model") == 16_000
 
 

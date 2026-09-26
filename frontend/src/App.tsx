@@ -315,7 +315,7 @@ function contextMetrics(events: Event[], estimated: number, actual: number | nul
   const percent = used ? Math.min(100, (used / limit) * 100) : null;
   const remaining = percent === null ? "—" : `剩余 ${Math.max(0, 100 - percent).toFixed(percent < 1 ? 2 : 1)}%`;
   const detail = used ? `${measured ? "实际输入" : "预估输入"} ${used.toLocaleString()} / ${limit.toLocaleString()} Token` : `尚无模型调用 · 上限 ${limit.toLocaleString()} Token`;
-  const actualDetail = measured ? "服务商用量" : running ? "实际用量待返回" : "实际用量未提供，压缩仍按估算触发";
+  const actualDetail = measured ? "服务商返回实际输入；压缩按本地估算触发" : running ? "实际用量待返回；压缩按本地估算触发" : "实际用量未提供；压缩按本地估算触发";
   return { percent, remaining, detail, actualDetail, compressions: compressions.length, latestCompression };
 }
 function projectName(path: string) { return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path; }

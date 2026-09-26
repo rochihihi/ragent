@@ -93,11 +93,24 @@ MODEL_CONTEXT_WINDOWS = {
     ("openai", "gpt-5.6-terra"): 1_050_000,
     ("openai", "gpt-5.6-luna"): 1_050_000,
     ("openai_official", "gpt-6-astra"): 1_050_000,
+    # Keep the official model's context window separate from the conservative
+    # fallback used for unknown OpenAI-compatible proxy models.  Falling back
+    # to 16k here made the UI report a false limit for the official Luna model.
+    ("openai_official", "gpt-6-luna"): 1_050_000,
 }
 
 
 def context_limit_for_model(provider: str, model: str) -> int:
-    return MODEL_CONTEXT_WINDOWS.get((provider, model), DEFAULT_CONTEXT_LIMIT)
+    configured = MODEL_CONTEXT_WINDOWS.get((provider, model))
+    if configured is not None:
+        return configured
+    # OpenAI-compatible gateways expose the same GPT model families under a
+    # different provider key. The endpoint is not the context window: a proxy
+    # serving gpt-6-luna must use the GPT window, not the generic 16k fallback.
+    normalized = model.strip().casefold()
+    if provider in {"openai", "openai_official"} and normalized.startswith("gpt-"):
+        return 1_050_000
+    return DEFAULT_CONTEXT_LIMIT
 
 
 def _find_go_executable() -> str | None:
