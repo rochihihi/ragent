@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ragent"
+version = "3.0.0"
+description = "A verifiable, recoverable repository-level software repair agent."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.20,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "keyring>=25,<27",
+  "openai>=2,<3",
+  "pydantic>=2.10,<3",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+  "mypy>=1.15,<2",
+  "build>=1.2,<2",
+  "hatchling>=1.27,<2",
+]
+desktop = [
+  "Pillow>=11,<13",
+  "pywebview>=5.4,<7",
+  "pyinstaller>=6.11,<7",
+  "pystray>=0.19,<1",
+  "pytest>=8,<10",
+]
+
+[project.scripts]
+veripatch = "veripatch.cli:main"
+veripatch-desktop = "veripatch.desktop:main"
+ragent = "veripatch.cli:main"
+ragent-desktop = "veripatch.desktop:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/veripatch"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = [
+  "src/veripatch/credentials.py",
+  "src/veripatch/desktop.py",
+  "src/veripatch/studio_model.py",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/veripatch/api.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["keyring", "uvicorn", "webview"]
+ignore_missing_imports = true

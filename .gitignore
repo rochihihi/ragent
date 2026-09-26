@@ -1,0 +1,25 @@
+.venv/
+.local-doc-backup/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+.codex-recovery/
+.env
+*.sqlite3
+runs/
+dist/
+build/
+frontend/node_modules/
+frontend/dist/
+*.spec
+*.egg-info/
+
+# Evaluation repositories and generated artifacts
+benchmarks/repos/
+results/*.jsonl
+results/*.csv
+results/*.md

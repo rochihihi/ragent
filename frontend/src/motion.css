@@ -1,0 +1,157 @@
+:root {
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.25, 1.15);
+  --ease-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --motion-fast: 180ms;
+  --motion-medium: 360ms;
+  --motion-slow: 620ms;
+}
+
+html { background: #d7d9dc; }
+button, select, input, textarea, .session-row, .file-tree button, .timeline summary {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button {
+  transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease,
+    border-color var(--motion-fast) ease, box-shadow var(--motion-medium) var(--ease-out-expo),
+    transform var(--motion-fast) var(--ease-spring), opacity var(--motion-fast) ease;
+}
+button:not(:disabled):active { transform: scale(0.965); transition-duration: 80ms; }
+button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+  outline: 3px solid rgba(54, 105, 212, 0.17);
+  outline-offset: 2px;
+}
+
+.sidebar, .conversation, .trace {
+  animation: panel-arrive var(--motion-slow) var(--ease-out-expo) both;
+  will-change: transform, opacity;
+}
+.conversation { animation-delay: 45ms; }
+.trace { animation-delay: 90ms; }
+@keyframes panel-arrive {
+  from { opacity: 0; transform: translateY(10px) scale(0.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.titlebar img {
+  transition: transform var(--motion-medium) var(--ease-spring),
+    box-shadow var(--motion-medium) var(--ease-out-expo);
+}
+.titlebar img:hover { transform: translateY(-1px) scale(1.055); box-shadow: 0 8px 20px rgba(25, 28, 38, 0.16); }
+
+.session-row {
+  position: relative;
+  transition: background-color var(--motion-medium) var(--ease-out-expo),
+    box-shadow var(--motion-medium) var(--ease-out-expo), transform var(--motion-fast) var(--ease-soft);
+}
+.session-row::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 999px;
+  background: #3569d4;
+  opacity: 0;
+  transform: scaleY(0.25);
+  transition: opacity var(--motion-fast) ease, transform var(--motion-medium) var(--ease-spring);
+}
+.session-row:hover { background: rgba(255, 255, 255, 0.48); transform: translateX(2px); }
+.session-row.active { transform: translateX(0); }
+.session-row.active::before { opacity: 1; transform: scaleY(1); }
+.session-row .delete { opacity: 0; transform: translateX(3px) scale(0.9); }
+.session-row:hover .delete, .session-row:focus-within .delete {
+  opacity: 1;
+  transform: translateX(0) scale(1);
+}
+.file-tree button { transition: background-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-soft); }
+.file-tree button:hover { transform: translateX(3px); }
+
+.hero { animation: content-rise 440ms var(--ease-out-expo) both; }
+.hero h1 { animation: title-resolve 520ms var(--ease-out-expo) both; }
+@keyframes content-rise { from { opacity: 0; transform: translateY(8px); } }
+@keyframes title-resolve { from { opacity: 0; transform: translateY(12px); filter: blur(4px); } }
+
+.messages { scroll-behavior: smooth; }
+.messages article {
+  animation: message-arrive 420ms var(--ease-out-expo) both;
+  animation-delay: calc(min(var(--message-index), 8) * 28ms);
+  transform-origin: 50% 100%;
+}
+.messages article.user { transform-origin: 100% 100%; }
+.messages article.assistant { transform-origin: 0 100%; }
+@keyframes message-arrive {
+  from { opacity: 0; transform: translateY(9px) scale(0.985); filter: blur(2px); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+.welcome { animation: welcome-arrive 700ms var(--ease-out-expo) both; }
+.welcome img { animation: logo-float 5s ease-in-out 800ms infinite; }
+@keyframes welcome-arrive { from { opacity: 0; transform: translateY(14px) scale(0.98); } }
+@keyframes logo-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+
+.compose-card {
+  transition: border-color var(--motion-medium) ease, box-shadow var(--motion-medium) var(--ease-out-expo),
+    transform var(--motion-medium) var(--ease-out-expo), background-color var(--motion-medium) ease;
+}
+.compose-card:focus-within {
+  border-color: rgba(53, 105, 212, 0.28);
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 28px 80px rgba(35, 38, 48, 0.18), 0 0 0 4px rgba(53, 105, 212, 0.055);
+  transform: translateY(-2px);
+}
+.compose-card > button:not(:disabled):hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 10px 24px rgba(47, 99, 200, 0.3); }
+.compose-card > button:not(:disabled):active { transform: translateY(0) scale(0.94); }
+.spinner { animation: spin 800ms linear infinite, spinner-breathe 1.6s ease-in-out infinite; }
+@keyframes spinner-breathe { 50% { opacity: 0.58; } }
+
+.model-controls select { transition: border-color var(--motion-fast) ease, background-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease; }
+.effort-control input[type="range"] { cursor: grab; accent-color: #3569d4; }
+.effort-control input[type="range"]:active { cursor: grabbing; }
+.effort-control b { transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-spring); }
+.effort-control:focus-within b { transform: scale(1.06); }
+
+.state { transition: color var(--motion-medium) ease, background-color var(--motion-medium) ease, border-color var(--motion-medium) ease; }
+.state i { transition: background-color var(--motion-medium) ease, box-shadow var(--motion-medium) ease, transform var(--motion-medium) var(--ease-spring); }
+.state.running i { animation: status-pulse 2s ease-out infinite; }
+@keyframes status-pulse { 0%, 100% { box-shadow: 0 0 0 4px rgba(98, 152, 255, 0.12); } 50% { box-shadow: 0 0 0 8px rgba(98, 152, 255, 0); } }
+
+.timeline details {
+  animation: event-arrive 360ms var(--ease-out-expo) both;
+  animation-delay: calc(min(var(--event-index), 7) * 34ms);
+}
+@keyframes event-arrive { from { opacity: 0; transform: translateX(8px); } }
+.timeline summary { transition: background-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-soft); }
+.timeline summary:hover { transform: translateX(2px); }
+.timeline summary > i { transition: color var(--motion-medium) ease, background-color var(--motion-medium) ease, transform var(--motion-medium) var(--ease-spring); }
+.timeline details[open] summary > i { transform: rotate(45deg) scale(1.04); }
+.timeline pre { animation: evidence-reveal 280ms var(--ease-out-expo) both; transform-origin: top; }
+@keyframes evidence-reveal { from { opacity: 0; transform: translateY(-5px) scaleY(0.97); } }
+
+.modal { animation: veil-in 260ms ease-out both; }
+.modal-card { animation: modal-in 440ms var(--ease-out-expo) both; transform-origin: 50% 45%; }
+@keyframes veil-in { from { opacity: 0; backdrop-filter: blur(0); } }
+@keyframes modal-in { from { opacity: 0; transform: translateY(16px) scale(0.965); } }
+.folder-pop { animation: sheet-in 360ms var(--ease-out-expo) both; }
+@keyframes sheet-in { from { opacity: 0; transform: translateY(12px) scale(0.985); } }
+.drawer { animation: drawer-in 500ms var(--ease-out-expo) both; transform-origin: right center; }
+@keyframes drawer-in { from { opacity: 0; transform: translateX(28px) scale(0.985); } }
+.drawer pre { animation: code-resolve 300ms var(--ease-out-expo) both; }
+@keyframes code-resolve { from { opacity: 0.2; filter: blur(2px); } }
+.permission-card, .toast { animation: notice-in 420ms var(--ease-spring) both; }
+@keyframes notice-in { from { opacity: 0; transform: translateY(14px) scale(0.97); } }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { border: 3px solid transparent; border-radius: 999px; background: rgba(110, 116, 128, 0.34); background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(82, 89, 104, 0.52); background-clip: padding-box; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

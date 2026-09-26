@@ -1,0 +1,10 @@
+.git-init-card{width:min(640px,94vw);height:auto;min-height:470px}
+.git-init{display:grid;place-content:center;justify-items:center;padding:42px;text-align:center}
+.git-init>i{width:68px;height:68px;display:grid;place-items:center;border-radius:22px;color:#fff;background:#252830;font-size:32px;font-style:normal}
+.git-init h3{margin:20px 0 6px;font-size:21px}
+.git-init p{max-width:480px;margin:5px 0;color:#757b85;line-height:1.6}
+.git-init code{padding:2px 5px;border-radius:5px;background:#e7e9ed}
+.git-init label{width:280px;display:grid;gap:7px;margin:20px 0 10px;color:#4f535b;font-size:12px;font-weight:700;text-align:left}
+.git-init input{padding:10px 12px;border:1px solid #d7d9de;border-radius:10px;background:#fff}
+.git-init>button{padding:11px 18px}
+.git-init .notice{margin-top:14px}
