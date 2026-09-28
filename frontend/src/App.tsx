@@ -13,6 +13,7 @@ const effort: Record<Provider, Array<[string, string]>> = {
   openai_official: [["low", "低"], ["medium", "中"], ["high", "高"], ["xhigh", "超高"], ["max", "最高"]],
 };
 const actionNames: Record<string, string> = { created: "会话已创建", user_message: "收到任务", assistant_message: "完整回答", workspace_entry_created: "项目条目已创建", task_contract: "建立任务契约", intent_clarification: "澄清任务意图", intent_classifier_fallback: "意图分类安全降级", context_compaction_fallback: "上下文摘要恢复", context_compressed: "上下文已压缩", context_trimmed: "上下文已裁剪", steer_queued: "运行中纠正已排队", steer_applied: "已切换任务目标", plan: "制定计划", plan_resumed: "恢复执行计划", context_prepared: "上下文已准备", model_waiting: "等待模型", model_retrying: "精简重试", model_response: "模型响应", model_diagnostic: "调用诊断", duplicate_corrected: "自动纠正重复动作", decision: "Agent 决策", observation: "工具结果", patch: "补丁已应用", permission_requested: "请求权限", permission_revised: "调整执行方案", permission_approved: "权限已允许", permission_execution_failed: "已允许，执行失败", permission_recovered: "权限状态已恢复", permission_denied: "权限被拒绝", interrupted: "执行已中断", paused: "任务已暂停", failed: "任务停止", completed: "任务完成", settings_updated: "配置已更新" };
+const primaryTraceEvents = new Set(["assistant_message", "observation", "permission_requested", "permission_revised", "permission_approved", "permission_execution_failed", "permission_denied", "interrupted", "paused", "failed", "completed", "model_diagnostic", "context_compressed", "context_trimmed"]);
 
 const activityText: Record<string, string> = {
   preparing_context: "整理上下文",
@@ -49,6 +50,7 @@ export function App() {
   const [leftPane, setLeftPane] = useState(270);
   const [rightPane, setRightPane] = useState(330);
   const [showTrace, setShowTrace] = useState(false);
+  const [showDetailedTrace, setShowDetailedTrace] = useState(false);
   const [showSidebar, setShowSidebar] = useState(true);
   const [showLatest, setShowLatest] = useState(false);
   const [clock, setClock] = useState(Date.now());
@@ -181,8 +183,10 @@ export function App() {
     (message, index, all) => !message.content.startsWith("调整执行方案：") && !message.content.startsWith("关于当前待批准操作，请调整方案：") && (index === 0 || message.content !== all[index - 1].content || message.role !== all[index - 1].role),
   ), [active?.messages]);
   const activityEvents = useMemo(
-    () => events.filter((item) => !["settings_updated", "memory_updated", "plan_updated"].includes(item.event_type)),
-    [events],
+    () => events.filter((item) => showDetailedTrace
+      ? !["settings_updated", "memory_updated", "plan_updated"].includes(item.event_type)
+      : primaryTraceEvents.has(item.event_type)),
+    [events, showDetailedTrace],
   );
   const contextUsage = useMemo(
     () => contextMetrics(
@@ -220,7 +224,7 @@ export function App() {
         <form className="composer" onSubmit={send}><div className="compose-card"><textarea value={draft} onChange={(e) => setDraft(e.target.value)} placeholder={active?.status === "running" ? "输入纠正或追加要求，将在安全边界切换…" : "给 RAgent 一个任务…"} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} /><button type="submit" disabled={!active || !draft.trim()}>{active?.status === "running" ? "追加" : "发送"}</button><ComposerMeta key={modal === "api" ? "api" : "ready"} session={active} onChanged={refresh} /></div></form>
       </main>
       <div className="pane-resizer right" onPointerDown={(event) => resizePane("right", event)} />
-      <aside className="trace"><header><div className="trace-heading"><strong>执行记录</strong><small>{activityEvents.length} 条记录</small></div><span className={`state ${active?.status || "idle"}`}><i />{activityText[active?.activity || active?.status || "idle"] || "待命"}</span></header><div className="activity-feed">{activityEvents.slice().reverse().map((item) => <details className={`activity-entry event-${item.event_type}`} key={item.sequence} open={["failed", "paused"].includes(item.event_type)}><summary><span className="activity-head"><strong>{actionNames[item.event_type] || item.event_type}</strong><time>{new Date(item.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time></span><small>{summary(item)}</small></summary><pre>{JSON.stringify(item.payload, null, 2)}</pre></details>)}</div><footer className="trace-summary"><div><span>执行步骤</span><strong>{active?.step || 0}</strong></div><div><span>修改文件</span><strong>{active?.changed_files.length || 0}</strong></div><div className="context-usage"><span>最近一次模型上下文</span><strong>{contextUsage.remaining}</strong><small>{contextUsage.detail}<br />{contextUsage.actualDetail}</small><i><b style={{ width: `${Math.min(contextUsage.percent || 0, 100)}%` }} /></i></div><div className="context-compression"><span>上下文处理</span><strong>{contextUsage.compressions ? `${contextUsage.compressions} 次` : "未触发"}</strong>{contextUsage.latestCompression && <small>{contextUsage.latestCompression}</small>}</div><div><span>当前阶段</span><strong className={active?.status || "idle"}>{activityText[active?.activity || active?.status || "idle"] || "待命"}</strong></div></footer></aside>
+<aside className="trace"><header><div className="trace-heading"><strong>执行记录</strong><small>{activityEvents.length} 条记录</small><button type="button" className="trace-detail-toggle" onClick={() => setShowDetailedTrace(!showDetailedTrace)}>{showDetailedTrace ? "精简" : "全部记录"}</button></div><span className={`state ${active?.status || "idle"}`}><i />{activityText[active?.activity || active?.status || "idle"] || "待命"}</span></header><div className="activity-feed">{activityEvents.slice().reverse().map((item) => <details className={`activity-entry event-${item.event_type}`} key={item.sequence} open={["failed", "paused"].includes(item.event_type)}><summary><span className="activity-head"><strong>{actionNames[item.event_type] || item.event_type}</strong><time>{new Date(item.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time></span><small>{summary(item)}</small></summary><pre>{JSON.stringify(item.payload, null, 2)}</pre></details>)}</div><footer className="trace-summary"><div><span>累计决策步</span><strong>{active?.step || 0}</strong></div><div><span>修改文件</span><strong>{active?.changed_files.length || 0}</strong></div><div className="context-usage"><span>最近一次模型上下文</span><strong>{contextUsage.remaining}</strong><small>{contextUsage.detail}<br />{contextUsage.actualDetail}</small><i><b style={{ width: `${Math.min(contextUsage.percent || 0, 100)}%` }} /></i></div><div className="context-compression"><span>上下文处理</span><strong>{contextUsage.compressions ? `${contextUsage.compressions} 次` : "未触发"}</strong>{contextUsage.latestCompression && <small>{contextUsage.latestCompression}</small>}</div><div><span>当前阶段</span><strong className={active?.status || "idle"}>{activityText[active?.activity || active?.status || "idle"] || "待命"}</strong></div></footer></aside>
     </div>
     {error && <div className="toast" onClick={() => setError("")}>{error}</div>}
     {modal === "new" && <NewSession onClose={() => setModal(null)} onCreated={async (id) => { setModal(null); await loadSessions(); setActiveId(id); }} />}

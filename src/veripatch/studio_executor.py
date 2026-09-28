@@ -34,6 +34,39 @@ class StudioActionExecutor:
         self.record_command_effects = record_command_effects
         self.run_verification = run_verification
 
+    def delete_batch(
+        self, session: StudioSession, workspace: SafeWorkspace, paths: list[str]
+    ) -> tuple[StudioObservation | None, StudioObservation | None]:
+        """Execute one approved delete operation while retaining per-path evidence."""
+        deleted: list[dict[str, Any]] = []
+        failure: StudioObservation | None = None
+        for path in paths:
+            try:
+                deleted.append(workspace.delete_path(path))
+            except Exception as exc:
+                failure = StudioObservation(
+                    kind="tool_error",
+                    summary=f"批量删除在 {path} 处停止：{type(exc).__name__}: {exc}",
+                    payload={
+                        "action": StudioAction.DELETE_PATH.value,
+                        "path": path,
+                        "deleted_paths": [item["path"] for item in deleted],
+                        "remaining_paths": paths[len(deleted):],
+                        "retryable": False,
+                    },
+                )
+                break
+        if not deleted:
+            return None, failure
+        changed = [item["path"] for item in deleted]
+        self.record_changed_paths(session, changed)
+        return StudioObservation(
+            kind="delete",
+            summary=f"已批量删除 {len(changed)} 个文件。",
+            payload={"paths": changed, "items": deleted, "changed_files": changed,
+                     "diff": workspace.diff()},
+        ), failure
+
     def read(self, workspace: SafeWorkspace, decision: StudioDecision) -> StudioObservation | None:
         if decision.action is StudioAction.LIST_FILES:
             files = self.file_tree(workspace.root)
@@ -207,7 +240,7 @@ class StudioActionExecutor:
             summary=(
                 "进程已启动，尚未确认窗口；可轮询现有进程。"
                 if outcome.launch_state == "running_unconfirmed"
-                else "系统已接受打开文件的请求。"
+                else "已调用系统默认程序打开文件。"
                 if outcome.launch_state == "dispatched"
                 else "命令执行成功。" if outcome.exit_code == 0
                 else "命令执行未通过。"

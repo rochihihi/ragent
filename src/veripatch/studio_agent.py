@@ -67,6 +67,7 @@ from veripatch.studio_permissions import requires_approval, session_grant_matche
 from veripatch.studio_store import StudioStore
 from veripatch.studio_runtime import StudioExecutionRuntime
 from veripatch.studio_executor import StudioActionExecutor
+from veripatch.studio_turn import TurnNext, next_after_tool
 from veripatch.studio_tools import (
     TERMINALS,
     SafeStudioCommandRunner,
@@ -1159,80 +1160,31 @@ class StudioAgent:
                 if self._execute_batch(session, workspace, decision.actions, user_message):
                     return session
                 symbol_index.refresh(session.turn_changed_files)
-                if (
-                    session.turn_changed_files
-                    and session.verification_passed
-                    and not self._validate_task_contract(session)
-                ):
-                    return self._finish_from_verified_evidence(
-                        session, workspace, "批量动作完成后验收证据齐全"
-                    )
                 continue
             terminal = self._execute(session, workspace, decision)
             if terminal:
                 return session
-            if (
-                decision.action in {StudioAction.RUN_TESTS, StudioAction.RUN_COMMAND}
-                and self.is_verification_command(decision.command)
-                and session.turn_changed_files
-                and session.verification_passed
-                and not self._validate_task_contract(session)
-            ):
+            next_step = next_after_tool(
+                session,
+                decision,
+                verification_command=(
+                    decision.action in {StudioAction.RUN_TESTS, StudioAction.RUN_COMMAND}
+                    and self.is_verification_command(decision.command)
+                ),
+                requirements_met=(
+                    not self._validate_task_contract(session)
+                    if session.turn_changed_files and session.verification_passed
+                    else False
+                ),
+            )
+            if next_step is TurnNext.COMPLETE_VERIFIED:
                 return self._finish_from_verified_evidence(
                     session, workspace, "验证通过后验收证据齐全"
                 )
-            if session.observations and session.observations[-1].kind in {
-                "tool_error",
-                "capability_guard",
-            }:
-                continue
-            if decision.action in {
-                StudioAction.EDIT,
-                StudioAction.APPLY_PATCH,
-                StudioAction.CREATE,
-                StudioAction.MOVE_FILE,
-                StudioAction.COPY_FILE,
-                StudioAction.DELETE_PATH,
-                StudioAction.GIT_RESTORE,
-            }:
+            if next_step is TurnNext.FOLLOW_UP_MUTATION:
                 symbol_index.refresh(session.turn_changed_files)
-                # Successful writes invalidate stale read/search evidence.
-                # The epoch makes a subsequent inspection or verification a
-                # legitimate new action instead of a duplicate.
-                verification = self._direct_verification_decision(session, user_message)
-                if verification is not None:
-                    session.step += 1
-                    self.store.save(
-                        session,
-                        "decision",
-                        {
-                            "action": verification.action,
-                            "rationale": verification.rationale,
-                            "command": verification.command,
-                        },
-                    )
-                    if self._execute(session, workspace, verification):
-                        return session
-                    if session.verification_passed:
-                        finish = StudioDecision(
-                            action=StudioAction.FINISH,
-                            rationale="用户指定的验证在修改后通过",
-                            message="修改已经写入当前工作区。",
-                        )
-                        if self._execute(session, workspace, finish):
-                            return session
-                elif self._verify_static_web_artifacts(session, workspace):
-                    finish = StudioDecision(
-                        action=StudioAction.FINISH,
-                        rationale="静态 Web 项目本地校验通过",
-                        message="网页结构与脚本检查通过。",
-                    )
-                    # Finishing can be rejected by the task contract (for
-                    # example, "create, verify, then open").  In that case the
-                    # agent must stay in this turn and perform the remaining
-                    # action instead of returning with status=running forever.
-                    if self._execute(session, workspace, finish):
-                        return session
+                if self._follow_up_after_mutation(session, workspace, user_message):
+                    return session
         if session.turn_changed_files and session.verification_passed:
             return self._finish_from_verified_evidence(session, workspace, "预算结束时证据齐全")
         if session.turn_changed_files and not session.verification_passed:
@@ -1552,6 +1504,25 @@ class StudioAgent:
         ):
             self._request_action_approval(session, batch)
             return True
+        if all(a.action is StudioAction.DELETE_PATH for a in actions):
+            paths = [a.path for a in actions if a.path is not None]
+            grant = approval_fingerprint(batch)
+            if grant in session.once_grants:
+                session.once_grants.remove(grant)
+            self._mark_action_started(session, actions[0])
+            self.store.save(
+                session,
+                "decision",
+                {"action": batch.action.value, "operation": "delete_paths",
+                 "paths": paths, "batch_size": len(paths)},
+            )
+            deleted, failure = self.executor.delete_batch(session, workspace, paths)
+            if deleted is not None:
+                self._commit_observation(session, workspace, StudioAction.DELETE_PATH, deleted)
+            if failure is not None:
+                self._commit_observation(session, workspace, StudioAction.DELETE_PATH, failure)
+                return True
+            return False
         grant = approval_fingerprint(batch)
         approved = grant in session.once_grants or grant in session.action_grants
         if grant in session.once_grants:
@@ -1564,7 +1535,7 @@ class StudioAgent:
             self._mark_action_started(session, action)
             self.store.save(
                 session,
-                "decision",
+                "batch_item",
                 {
                     "action": action.action,
                     "rationale": action.rationale,
@@ -1597,13 +1568,10 @@ class StudioAgent:
             }
             if terminal:
                 return True
-        if changed and not session.verification_passed:
-            direct = self._direct_verification_decision(session, user_message)
-            if direct is not None:
-                if self._execute(session, workspace, direct):
-                    return True
-            else:
-                self._verify_static_web_artifacts(session, workspace)
+        if changed and self._follow_up_after_mutation(
+            session, workspace, user_message, finish_when_ready=False
+        ):
+            return True
         if changed and session.verification_passed:
             finish = StudioDecision(
                 action=StudioAction.FINISH,
@@ -1611,6 +1579,46 @@ class StudioAgent:
                 message="批量修改与本地检查通过。",
             )
             return self._execute(session, workspace, finish)
+        return False
+
+    def _follow_up_after_mutation(
+        self,
+        session: StudioSession,
+        workspace: SafeWorkspace,
+        user_message: str,
+        *,
+        finish_when_ready: bool = True,
+    ) -> bool:
+        """One post-write policy for single and batched file operations.
+
+        The runtime only forces a check when the user explicitly requested it,
+        or when a static web artifact can be checked without running a command.
+        All other outcomes return to the model's tool/answer loop.
+        """
+        if session.verification_passed:
+            return False
+        direct = self._direct_verification_decision(session, user_message)
+        if direct is not None:
+            session.step += 1
+            self.store.save(session, "decision", {
+                "action": direct.action, "rationale": direct.rationale,
+                "command": direct.command,
+            })
+            if self._execute(session, workspace, direct):
+                return True
+            if finish_when_ready and session.verification_passed:
+                return self._execute(session, workspace, StudioDecision(
+                    action=StudioAction.FINISH,
+                    rationale="用户指定的验证在修改后通过",
+                    message="修改已经写入当前工作区。",
+                ))
+            return False
+        if self._verify_static_web_artifacts(session, workspace) and finish_when_ready:
+            return self._execute(session, workspace, StudioDecision(
+                action=StudioAction.FINISH,
+                rationale="静态 Web 项目本地校验通过",
+                message="网页结构与脚本检查通过。",
+            ))
         return False
 
     def _finish_bulk_delete(
@@ -2786,7 +2794,7 @@ class StudioAgent:
             scope=decision.path or session.repo_root,
             impact="批准后执行显示的操作；不会扩大本次任务的授权范围。",
             risk="high"
-            if decision.action in {StudioAction.DELETE_PATH, StudioAction.GIT_RESTORE}
+            if decision.action in {StudioAction.BATCH, StudioAction.DELETE_PATH, StudioAction.GIT_RESTORE}
             else "medium",
         )
         if command:
@@ -4054,8 +4062,8 @@ class StudioAgent:
                 ),
                 StudioPlanItem(
                     key="review",
-                    title="确认窗口已出现并报告结果",
-                    note="检测到可见窗口后结束，不重复启动。",
+                    title="报告打开操作的结果",
+                    note="系统接受打开请求即可结束；只有用户要求确认显示时才检查窗口。",
                 ),
             ]
 
@@ -4113,7 +4121,7 @@ class StudioAgent:
                 StudioPlanItem(
                     key="launch",
                     title="请求权限并打开新产物",
-                    note="验证通过后仅启动一次，并确认窗口是否出现。",
+                    note="验证通过后仅启动一次；系统接受打开请求即满足普通打开任务。",
                 )
             )
         plan.append(
@@ -4380,9 +4388,10 @@ class StudioAgent:
             }:
                 return (
                     "启动动作已执行，本轮不得再次启动同一目标。"
-                    "根据最新工具结果直接 respond 或 finish：dispatched 只表示系统接收了"
-                    "打开请求，不能声称窗口已出现；running_unconfirmed 只表示进程在运行；"
-                    "仅 window_confirmed 才能确认可见窗口。"
+                    "普通打开任务在系统接受打开请求后即可 respond 或 finish，"
+                    "简洁报告已调用系统打开目标，不必附加窗口未确认的免责声明。"
+                    "若用户明确要求确认界面显示，则须取得可见窗口或截图证据；"
+                    "没有此证据时不能声称亲眼看到了窗口。"
                 )
         if session.observations and session.observations[-1].kind in {"test", "tool_error"}:
             payload = session.observations[-1].payload

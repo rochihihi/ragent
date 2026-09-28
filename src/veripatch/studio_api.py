@@ -1011,7 +1011,7 @@ def create_studio_router(settings: Settings) -> APIRouter:
                         summary=(
                             "进程已启动，尚未确认窗口；可轮询现有进程。"
                             if outcome.launch_state == "running_unconfirmed"
-                            else "系统已接受打开文件的请求。"
+                            else "已调用系统默认程序打开文件。"
                             if outcome.launch_state == "dispatched"
                             else "已执行允许的命令。" if outcome.passed
                             else "允许的命令执行未通过。"

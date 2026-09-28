@@ -351,10 +351,18 @@ class SafeWorkspace:
             path.rmdir()
             result = {"path": relative.as_posix(), "kind": "empty_directory"}
         else:
-            content = self._read_text(path)
-            self._original_contents.setdefault(relative.as_posix(), content)
+            size = path.stat().st_size
+            try:
+                content = self._read_text(path)
+            except ValueError:
+                # Binary and oversized artifacts have no text diff, but an
+                # explicitly approved delete must still be able to remove them.
+                content = None
+            if content is not None:
+                self._original_contents.setdefault(relative.as_posix(), content)
             path.unlink()
-            result = {"path": relative.as_posix(), "kind": "file", "bytes": len(content.encode())}
+            result = {"path": relative.as_posix(), "kind": "file", "bytes": size,
+                      "text_diff_available": content is not None}
         if os.path.lexists(path):
             raise OSError(f"Deletion postcondition failed: {relative.as_posix()}")
         return {**result, "postcondition": "absent"}

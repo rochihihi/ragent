@@ -125,7 +125,9 @@ def test_bulk_delete_one_approval_and_turn_local_reply(tmp_path: Path) -> None:
     assert "旧默认参数" not in reply
     assert "静态检查" not in reply
     assert reply.count("完成内容") == 1
-    assert len([o for o in session.observations if o.kind == "delete"]) == 3
+    deletes = [o for o in session.observations if o.kind == "delete"]
+    assert len(deletes) == 1
+    assert deletes[0].payload["paths"] == ["app.py", "test_app.py", "test_other.py"]
 
 
 def test_command_file_effects_invalidate_old_verification(tmp_path: Path) -> None:
@@ -1477,6 +1479,26 @@ def test_successful_mcp_read_is_available_before_any_duplicate(tmp_path: Path) -
     }
     assert StudioAgent._latest_tool_result(session)["observation_id"] == 0
     assert "足够就直接回答" in StudioAgent._next_instruction(session)
+
+
+def test_document_open_does_not_require_visible_window_for_completion(tmp_path: Path) -> None:
+    session = StudioSession(
+        session_id="document-open", repo_root=str(tmp_path),
+        provider="openai_official", model="gpt-6-luna", reasoning_effort="medium",
+        observations=[StudioObservation(
+            kind="command", summary="已调用系统默认程序打开文件。",
+            payload={"launch_state": "dispatched", "window_confirmed": None,
+                     "exit_code": 0, "launch_target": "calculator.html"},
+        )],
+    )
+    instruction = StudioAgent._next_instruction(session)
+    assert "系统接受打开请求后即可" in instruction
+    assert "不必附加窗口未确认" in instruction
+    plan = StudioAgent._build_plan(
+        VerificationMode.AUTO,
+        StudioTaskContract(objective="打开 calculator.html", intent="launch_only"),
+    )
+    assert any("系统接受打开请求即可结束" in item.note for item in plan)
 
 
 def test_explicit_mcp_request_routes_equivalent_native_read_to_mcp() -> None:

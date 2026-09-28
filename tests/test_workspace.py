@@ -242,3 +242,15 @@ def test_structured_delete_refuses_non_empty_directory_and_metadata(tmp_path: Pa
         workspace.delete_path("folder")
     with pytest.raises(WorkspaceSecurityError, match="Protected repository metadata"):
         workspace.delete_path(".git/config")
+
+
+def test_structured_delete_accepts_binary_artifact_without_text_diff(tmp_path: Path) -> None:
+    artifact = tmp_path / "cache.pyc"
+    artifact.write_bytes(b"\x00\xff\x80")
+    workspace = SafeWorkspace(tmp_path)
+
+    result = workspace.delete_path("cache.pyc")
+
+    assert result["postcondition"] == "absent"
+    assert result["text_diff_available"] is False
+    assert not artifact.exists()
