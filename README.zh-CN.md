@@ -4,7 +4,7 @@
 
 [English README](README.md)
 
-![RAgent 桌面工作区](assets/ragent-studio.png)
+![RAgent 桌面工作区](assets/ragent-studio-20260930.png)
 
 RAgent 将 DeepSeek 或 OpenAI 模型接入受控的本地项目工作区。模型负责提出结构化动作，确定性运行时负责路径边界、权限判断、文件变更、命令执行、结果验证、状态持久化与最终完成判定。
 

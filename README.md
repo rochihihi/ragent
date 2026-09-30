@@ -4,7 +4,7 @@
 
 [中文说明](README.zh-CN.md)
 
-![RAgent desktop workspace](assets/ragent-studio.png)
+![RAgent desktop workspace](assets/ragent-studio-20260930.png)
 
 RAgent connects DeepSeek or OpenAI models to a controlled local workspace. The model proposes typed actions; the runtime owns path boundaries, permissions, file mutations, command execution, verification, persistence, and the final completion decision.
 
