@@ -1,21 +1,24 @@
 # RAgent
 
-**A local-first desktop coding agent that reads repositories, edits files, runs verification, and preserves auditable evidence.**
+**A local-first desktop coding agent with model-led decisions, controlled tools, and auditable execution.**
 
 [中文说明](README.zh-CN.md)
 
 ![RAgent desktop workspace](assets/ragent-studio-20260930.png)
 
-RAgent connects DeepSeek or OpenAI models to a controlled local workspace. The model proposes typed actions; the runtime owns path boundaries, permissions, file mutations, command execution, verification, persistence, and the final completion decision.
+RAgent connects DeepSeek or OpenAI models to a controlled local workspace. The execution model interprets the user's original request, chooses typed actions, and decides when to respond. The local runtime enforces path boundaries, permissions, safe file operations, and persistence, while recording tool results and verification evidence.
 
-The result is a coding agent designed around one rule: a task is complete only when the workspace state and available verification evidence support that conclusion.
+In the desktop Studio's default Auto/Quick modes, evidence is returned to the model without imposing a fixed test-and-reopen workflow. Strict verification is an opt-in mode with additional runtime completion gates. A completed turn does not by itself mean that tests passed; verification status is reported separately.
 
 ## Highlights
 
 - **Structured agent loop** — planning, repository inspection, editing, command execution, observation, recovery, and completion use typed actions instead of free-form shell output.
-- **Verification-aware completion** — code changes invalidate stale evidence; related tests and project checks are discovered and recorded before verified completion.
+- **Evidence-aware verification** — file changes invalidate stale evidence. The model decides relevant checks in default modes; Strict mode adds runtime verification gates.
 - **Layered long-context management** — current requirements, task state, recent dialogue, file evidence, and older history are budgeted separately and compacted when necessary.
-- **Task contracts and semantic intent** — each turn tracks the active objective, target files, protected scope, acceptance conditions, and user corrections.
+- **Original-request authority** — the execution model interprets intent from the original request and dialogue, without a separate preflight intent classifier. Plans and task summaries are advisory, not replacements for user instructions.
+- **Pause and resume** — desktop tasks have no default fixed decision-step limit. Pause cancels pending model I/O; synchronous tools finish and save their results before pausing. Saved work can be resumed.
+- **Safe creation semantics** — creating an existing path returns a conflict instead of silently becoming an edit. The model can choose a new path; this does not prevent explicitly requested edits.
+- **Answer auditing** — default-mode evidence review is logged separately and does not replace the model's answer with a canned evidence message. Strict review may request a correction.
 - **Scoped permissions** — file access and commands are evaluated by operation, path, impact, and risk, with one-time or session-scoped approval.
 - **Durable recovery** — sessions, plans, observations, file changes, and context summaries are checkpointed in SQLite for safe continuation after interruption.
 - **Local project workspace** — persistent conversations, hierarchical file tree, file/folder creation, Diff review, Git operations, execution trace, and context usage are available in one desktop UI.
@@ -25,21 +28,24 @@ The result is a coding agent designed around one rule: a task is complete only w
 
 ```mermaid
 flowchart LR
-    U[User request] --> C[Task contract]
+    U[Original user request] --> C[Task state]
     C --> X[Context builder]
     X --> M[DeepSeek / OpenAI]
     M --> D[Typed decision]
     D --> T[Controlled tools]
     T --> O[Observation + evidence]
     O --> X
-    O --> V{Completion gate}
-    V -->|verified| R[Result]
-    V -->|incomplete| X
+    D --> A[Final response]
+    A --> V{Mode-specific review}
+    V -->|default: audit / strict: accepted| R[Result + verification status]
+    V -->|strict: correction needed| X
     C <--> S[(SQLite checkpoints)]
     O --> S
 ```
 
 The model can request repository reads, searches, precise edits, file operations, verification commands, or a final response. RAgent validates every request against the active workspace and permission policy before performing side effects.
+
+Tool results, including successful tests or launches, return to the model. Local control flow does not require reopening an artifact after verification. Intent and action selection are model decisions; access checks, approval enforcement, creation conflicts, and pause handling are local controls.
 
 ## Desktop workspace
 
@@ -47,7 +53,7 @@ The desktop application is organized into three coordinated areas:
 
 1. **Workspace** — conversations, repository tree, nested folders, changed-file markers, and direct file/folder creation.
 2. **Conversation** — natural-language tasks, Markdown/code rendering, completion evidence, runtime diagnostics, and live corrections.
-3. **Execution trace** — model decisions, tool results, permissions, verification events, context usage, and compression history.
+3. **Execution trace** — model decisions, tool results, permissions, verification events, context usage, and compression history. Detailed/all-record views load the full saved event history and allow inspection of long messages and tool payloads.
 
 Git, acceptance checks, skills, provider configuration, verification mode, response style, and reasoning effort are available without leaving the workspace.
 
@@ -57,7 +63,7 @@ Git, acceptance checks, skills, provider configuration, verification mode, respo
 - Protected metadata such as `.git`, `.github`, and `.codex` cannot be modified through file tools.
 - Commands pass capability checks and permission evaluation before execution.
 - Destructive actions require explicit approval and display their concrete scope.
-- Completion is based on runtime state and evidence, not solely on a model claim.
+- Default completion is model-led with evidence auditing; Strict mode adds runtime gates. Neither completion nor a launch request alone proves that tests passed or a GUI was visually verified.
 - Credentials are excluded from prompts, SQLite events, logs, and Git.
 
 ## Tech stack
@@ -111,10 +117,11 @@ Open <http://127.0.0.1:8000>. The API is local-first and should not be exposed d
 cd frontend
 npm install
 npm run check
+npm run test:trace
 npm run build
 ```
 
-The test suite covers task contracts, intent handling, permission boundaries, file operations, context compaction, verification gates, persistence, and recovery behavior.
+The test suite covers original-request authority, creation conflicts, answer preservation, pause/resume, permission boundaries, context compaction, verification modes, full execution history, persistence, and recovery behavior.
 
 ## Project structure
 
