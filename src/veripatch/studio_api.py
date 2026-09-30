@@ -13,6 +13,7 @@ import time
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
+from threading import Event
 from typing import Any
 from uuid import uuid4
 
@@ -104,7 +105,7 @@ class CreateProjectEntry(BaseModel):
 UPGRADE_CHECKS = {
     "task_contract": ("任务契约", "识别目标文件、保护范围、功能要求和兼容性约束"),
     "failure_strategy": ("失败恢复", "区分超时、缺少工具、认证及上游服务异常"),
-    "dynamic_budget": ("动态预算", "按任务复杂度分配步骤，并为有效进展保留续跑空间"),
+    "dynamic_budget": ("执行控制", "默认持续执行，通过暂停和继续保存并恢复任务进度"),
     "verification_gate": ("验证门禁", "只把真实测试、构建或静态检查视为验证证据"),
     "path_permission": ("路径与权限", "兼容相对/绝对路径，并保持工作区边界"),
 }
@@ -154,13 +155,13 @@ def _run_upgrade_check(check_id: str) -> dict[str, Any]:
             evidence.append("超时、认证、上游异常和缺少工具均得到不同恢复策略")
         elif check_id == "dynamic_budget":
             agent = object.__new__(StudioAgent)
-            agent.max_steps = 60
+            agent.max_steps = None
             simple = agent._dynamic_budget("解释这个项目", 8)
             complex_budget = agent._dynamic_budget(
                 "1. 重构跨文件状态恢复\n2. 修复并发问题\n3. 运行完整测试", 180
             )
-            assert 0 < simple < complex_budget <= 60
-            evidence.append(f"简单任务 {simple} 步，复杂任务 {complex_budget} 步，上限 60 步")
+            assert simple == complex_budget == agent.max_steps
+            evidence.append("交互会话默认无固定步数上限，由用户暂停并保存进度")
         elif check_id == "verification_gate":
             accepted = [
                 ["python", "-m", "py_compile", "app.py"],
@@ -323,6 +324,7 @@ def create_studio_router(settings: Settings) -> APIRouter:
     store = StudioStore(settings.database_path)
     tasks: dict[str, asyncio.Task[None]] = {}
     steer_queues: dict[str, deque[str]] = {}
+    pause_signals: dict[str, Event] = {}
 
     # A process exit destroys in-memory tasks but persisted sessions used to remain
     # `running` forever. Recover those sessions as resumable instead of making the UI
@@ -599,10 +601,10 @@ def create_studio_router(settings: Settings) -> APIRouter:
 
     @router.get("/studio-api/sessions/{session_id}/events")
     async def session_events(
-        session_id: str, after: int = Query(default=0, ge=0)
+        session_id: str, after: int = Query(default=0, ge=0), full: bool = False
     ) -> list[dict[str, Any]]:
         load_session(session_id)
-        return store.events(session_id, after)
+        return store.events(session_id, after, full=full)
 
     @router.get("/studio-api/sessions/{session_id}/files")
     async def session_files(session_id: str) -> dict[str, list[str]]:
@@ -760,25 +762,28 @@ def create_studio_router(settings: Settings) -> APIRouter:
         )
         try:
             model = StudioProviderModel(session.provider, model_settings)
-            if resume_after_permission and session.pending_model_call:
+            if (resume_after_permission or continuation) and session.pending_model_call:
                 model.restore_tool_continuation(
                     session.pending_model_call,
                     session_id=session.session_id,
                     turn_observation_start=session.turn_observation_start,
                 )
             queue = steer_queues.setdefault(session.session_id, deque())
-            await StudioAgent(
+            signal = pause_signals.setdefault(session.session_id, Event())
+            agent = StudioAgent(
                 model,
                 store,
-                max_steps=max(settings.max_steps, 60),
+                max_steps=None,
                 max_context_tokens=context_limit_for_model(session.provider, session.model),
                 consume_steer=lambda: queue.popleft() if queue else None,
-            ).handle(
-                session,
-                content,
-                continuation=continuation,
-                record_user_message=record_user_message,
-                resume_after_permission=resume_after_permission,
+                pause_requested=signal.is_set,
+            )
+            await asyncio.to_thread(
+                lambda: asyncio.run(agent.handle(
+                    session, content, continuation=continuation,
+                    record_user_message=record_user_message,
+                    resume_after_permission=resume_after_permission,
+                ))
             )
         except Exception as exc:
             session.status = "failed"
@@ -786,6 +791,7 @@ def create_studio_router(settings: Settings) -> APIRouter:
             store.save(session, "failed", {"reason": session.failure_reason})
         finally:
             tasks.pop(session.session_id, None)
+            pause_signals.pop(session.session_id, None)
             if not steer_queues.get(session.session_id):
                 steer_queues.pop(session.session_id, None)
 
@@ -1044,39 +1050,10 @@ def create_studio_router(settings: Settings) -> APIRouter:
                     return {"status": "approved"}
                 if (
                     session.verification_mode is VerificationMode.AUTO
-                    and session.turn_changed_files
-                    and outcome.passed
                     and command_execution.role == "verification"
                 ):
-                    session.verification_passed = True
+                    session.verification_passed = outcome.passed
                 store.save(session, "observation", observation.model_dump(mode="json"))
-                if (
-                    pending.destructive
-                    and outcome.passed
-                    and _is_pure_bulk_delete_request(_latest_task_message(session))
-                    and not studio_completion.snapshot(workspace.root)
-                ):
-                    # A bulk-delete command is intentionally terminal once the exact
-                    # command has been approved and succeeded. Sending it back to the
-                    # model caused follow-up probes and slightly different delete
-                    # commands to open an endless series of approval dialogs.
-                    session.status = "completed"
-                    session.activity = "completed"
-                    session.failure_reason = None
-                    session.pause_reason = None
-                    message = "已按你的授权完成清空操作；不会继续生成或执行其他删除命令。"
-                    session.messages.append(StudioMessage(role="assistant", content=message))
-                    store.save(
-                        session,
-                        "completed",
-                        {
-                            "summary": message,
-                            "command": pending.command,
-                            "destructive": True,
-                            "single_approval": True,
-                        },
-                    )
-                    return {"status": "approved"}
                 install_launch = pending.capability == "install:go"
                 if install_launch and pending.follow_up_command:
                     artifact_target = pending.follow_up_command[-1]
@@ -1209,6 +1186,33 @@ def create_studio_router(settings: Settings) -> APIRouter:
         )
         return {"status": "denied"}
 
+    @router.post("/studio-api/sessions/{session_id}/pause", status_code=202)
+    async def pause_session(session_id: str) -> dict[str, str]:
+        session = load_session(session_id)
+        if session_id not in tasks:
+            if session.status == "paused":
+                return {"status": "paused"}
+            raise HTTPException(status_code=409, detail="会话当前没有运行中的任务")
+        pause_signals.setdefault(session_id, Event()).set()
+        store.append_event(session_id, "pause_requested", {
+            "summary": "已请求暂停；当前工具完成并保存结果后停止。",
+        })
+        return {"status": "pausing"}
+
+    @router.post("/studio-api/sessions/{session_id}/resume", status_code=202)
+    async def resume_session(session_id: str) -> dict[str, str]:
+        session = load_session(session_id)
+        if session_id in tasks or session.status != "paused":
+            raise HTTPException(status_code=409, detail="仅可继续已暂停的任务")
+        content = _latest_task_message(session)
+        session.status = "running"
+        store.save(session, "resume_requested", {"summary": "从已保存的任务和证据继续。"})
+        tasks[session_id] = asyncio.create_task(execute(
+            session, content, continuation=True, record_user_message=False,
+        ), name=f"studio-{session_id}")
+        await asyncio.sleep(0)
+        return {"status": "accepted"}
+
     @router.post("/studio-api/sessions/{session_id}/messages", status_code=202)
     async def send_message(session_id: str, request: StudioUserMessage) -> dict[str, str]:
         session = load_session(session_id)
@@ -1227,6 +1231,9 @@ def create_studio_router(settings: Settings) -> APIRouter:
             return {"session_id": session_id, "status": "queued"}
         if session.status == "waiting_permission":
             raise HTTPException(status_code=409, detail="请先在权限对话框中拒绝或调整方案")
+        store.save(session.model_copy(update={
+            "status": "running", "activity": "preparing_context",
+        }), "run_requested", {"summary": "任务已提交后台执行。"})
         task = asyncio.create_task(execute(session, request.content), name=f"studio-{session_id}")
         tasks[session_id] = task
         # Let the worker persist the user message and running state before the

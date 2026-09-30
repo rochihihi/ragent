@@ -6,6 +6,7 @@ import Markdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import { CodeBlock } from "./CodeBlock";
 import remarkGfm from "remark-gfm";
+import { eventSummary as summary } from "./eventSummary";
 
 const effort: Record<Provider, Array<[string, string]>> = {
   deepseek: [["low", "低"], ["high", "高"], ["max", "最高"]],
@@ -14,6 +15,9 @@ const effort: Record<Provider, Array<[string, string]>> = {
 };
 const actionNames: Record<string, string> = { created: "会话已创建", user_message: "收到任务", assistant_message: "完整回答", workspace_entry_created: "项目条目已创建", task_contract: "建立任务契约", intent_clarification: "澄清任务意图", intent_classifier_fallback: "意图分类安全降级", context_compaction_fallback: "上下文摘要恢复", context_compressed: "上下文已压缩", context_trimmed: "上下文已裁剪", steer_queued: "运行中纠正已排队", steer_applied: "已切换任务目标", plan: "制定计划", plan_resumed: "恢复执行计划", context_prepared: "上下文已准备", model_waiting: "等待模型", model_retrying: "精简重试", model_response: "模型响应", model_diagnostic: "调用诊断", duplicate_corrected: "自动纠正重复动作", decision: "Agent 决策", observation: "工具结果", patch: "补丁已应用", permission_requested: "请求权限", permission_revised: "调整执行方案", permission_approved: "权限已允许", permission_execution_failed: "已允许，执行失败", permission_recovered: "权限状态已恢复", permission_denied: "权限被拒绝", interrupted: "执行已中断", paused: "任务已暂停", failed: "任务停止", completed: "任务完成", settings_updated: "配置已更新" };
 const primaryTraceEvents = new Set(["assistant_message", "observation", "permission_requested", "permission_revised", "permission_approved", "permission_execution_failed", "permission_denied", "interrupted", "paused", "failed", "completed", "model_diagnostic", "context_compressed", "context_trimmed"]);
+Object.assign(actionNames, { pause_requested: "请求暂停", resume_requested: "继续执行", run_requested: "开始执行", claim_review: "回答证据审核", result_review: "结果审核", memory_updated: "记忆已更新", plan_updated: "计划已更新" });
+primaryTraceEvents.add("claim_review");
+primaryTraceEvents.add("result_review");
 
 const activityText: Record<string, string> = {
   preparing_context: "整理上下文",
@@ -46,6 +50,8 @@ export function App() {
   const [fileView, setFileView] = useState<FileView>(null);
   const [error, setError] = useState("");
   const [permissionBusy, setPermissionBusy] = useState(false);
+  const [pausePending, setPausePending] = useState(false);
+  const [runControlBusy, setRunControlBusy] = useState(false);
   const [permissionSuggestion, setPermissionSuggestion] = useState("");
   const [leftPane, setLeftPane] = useState(270);
   const [rightPane, setRightPane] = useState(330);
@@ -96,9 +102,11 @@ export function App() {
     setSelectedDirectory("");
     setNewEntryKind(null);
     setNewEntryPath("");
+    setPausePending(false);
   }, [activeId]);
   useEffect(() => {
     if (active?.status !== "running") setRunStartedAt(null);
+    if (active?.status !== "running") setPausePending(false);
   }, [active?.status]);
   useEffect(() => { setPermissionSuggestion(""); }, [active?.pending_permission?.request_id]);
   useEffect(() => {
@@ -139,6 +147,23 @@ export function App() {
   async function remove(id: string) {
     if (!confirm("删除这个对话及其轨迹？")) return;
     try { await api.deleteSession(id); if (activeId === id) { setActiveId(null); setActive(null); } await loadSessions(); } catch (e) { setError((e as Error).message); }
+  }
+  async function controlRun() {
+    if (!active || runControlBusy || pausePending) return;
+    const id = active.session_id;
+    const pausing = active.status === "running";
+    setRunControlBusy(true);
+    try {
+      if (pausing) {
+        const result = await api.pause(id);
+        if (selectedSession.current === id) setPausePending(result.status === "pausing");
+      } else {
+        await api.resume(id);
+        if (selectedSession.current === id) setRunStartedAt(Date.now());
+      }
+      await refresh();
+    } catch (e) { setError((e as Error).message); }
+    finally { setRunControlBusy(false); }
   }
   async function openFile(path: string) { if (activeId) try { setFileView(await api.fileChange(activeId, path)); } catch (e) { setError((e as Error).message); } }
   async function createEntry(event: FormEvent) {
@@ -184,7 +209,7 @@ export function App() {
   ), [active?.messages]);
   const activityEvents = useMemo(
     () => events.filter((item) => showDetailedTrace
-      ? !["settings_updated", "memory_updated", "plan_updated"].includes(item.event_type)
+      ? true
       : primaryTraceEvents.has(item.event_type)),
     [events, showDetailedTrace],
   );
@@ -214,7 +239,7 @@ export function App() {
       </aside>
       <div className="pane-resizer left" onPointerDown={(event) => resizePane("left", event)} />
       <main className="conversation">
-        <header className="hero" key={`hero-${activeId || "empty"}`}><button aria-label="切换侧栏" aria-expanded={showSidebar} onClick={() => setShowSidebar(!showSidebar)}>☰</button><div className="conversation-heading"><h1>{active?.title || "开始一个编码任务"}</h1><p>{active ? `${active.provider} · ${active.model} · ${active.verification_mode}` : "选择项目，然后用自然语言要求 Agent 阅读、修改并验证代码。"}</p></div><div className="conversation-actions"><button disabled={!active || active.status === "running" || active.status === "waiting_permission"} onClick={() => setModal("skills")}>技能</button><button disabled={!active} onClick={() => setModal("settings")}>会话设置</button></div><button aria-expanded={showTrace} onClick={() => setShowTrace(!showTrace)}>执行记录</button></header>
+        <header className="hero" key={`hero-${activeId || "empty"}`}><button aria-label="切换侧栏" aria-expanded={showSidebar} onClick={() => setShowSidebar(!showSidebar)}>☰</button><div className="conversation-heading"><h1>{active?.title || "开始一个编码任务"}</h1><p>{active ? `${active.provider} · ${active.model} · ${active.verification_mode}` : "选择项目，然后用自然语言要求 Agent 阅读、修改并验证代码。"}</p></div><div className="conversation-actions">{active && ["running", "paused"].includes(active.status) && <button disabled={runControlBusy || pausePending} onClick={() => void controlRun()} title={active.status === "running" ? "暂停执行并保存进度；当前工具完成后停止" : "从已有进度继续"}>{pausePending ? "正在暂停…" : active.status === "running" ? "暂停" : "继续"}</button>}<button disabled={!active || active.status === "running" || active.status === "waiting_permission"} onClick={() => setModal("skills")}>技能</button><button disabled={!active} onClick={() => setModal("settings")}>会话设置</button></div><button aria-expanded={showTrace} onClick={() => setShowTrace(!showTrace)}>执行记录</button></header>
         <section ref={messagesRef} onScroll={trackMessageScroll} className="messages" key={`messages-${activeId || "empty"}`}>
           {visibleMessages.length ? visibleMessages.map((message, index) => <article className={message.role} style={{ "--message-index": Math.min(index, 8) } as CSSProperties} key={`${message.role}-${index}`}>{message.role === "assistant" && <img className="assistant-avatar" src="/studio-brand" alt="" />}<MessageContent content={message.content} /></article>) : <div className="welcome"><img src="/studio-brand" alt="" /><h2>从项目开始</h2><p>让 RAgent 阅读代码、修改文件，或检查测试结果。</p></div>}
           {active?.status === "running" && <WorkingStatus session={active} events={events.filter((event) => event.sequence > eventFloor)} now={clock} runStartedAt={runStartedAt} />}
@@ -265,6 +290,7 @@ function explainPermission(command: string[]) {
   return { purpose: "执行 Agent 为当前任务提议的操作。", impact: "无法自动确认完整影响，请查看下面的原始命令后再决定。", reason: "该命令用于继续当前任务。", risk: "unknown" };
 }
 function RuntimeDiagnostic({ session, events }: { session: Session; events: Event[] }) {
+  if (session.pause_reason?.startsWith("用户暂停")) return null;
   const boundary = events.reduce((last, event, index) => event.event_type === "user_message" || event.event_type === "steer_applied" ? index : last, -1);
   const currentEvents = boundary >= 0 ? events.slice(boundary) : [];
   const latest = (type: string) => [...currentEvents].reverse().find((event) => event.event_type === type);
@@ -294,12 +320,47 @@ function RuntimeDiagnostic({ session, events }: { session: Session; events: Even
     </div>
   </article>;
 }
-function WorkingStatus({ session, events, now, runStartedAt }: { session: Session; events: Event[]; now: number; runStartedAt: number | null }) { const boundary = events.reduce((last, event, index) => event.event_type === "user_message" || event.event_type === "steer_applied" ? index : last, -1); const currentEvents = boundary >= 0 ? events.slice(boundary) : events; const latest = currentEvents.at(-1); const candidates = [runStartedAt, latest ? new Date(latest.created_at).getTime() : null, session.updated_at ? new Date(session.updated_at).getTime() : null].filter((value): value is number => value !== null && Number.isFinite(value) && value <= now); const started = candidates.length ? Math.max(...candidates) : now; const seconds = Math.max(0, Math.floor((now - started) / 1000)); const elapsed = seconds >= 60 ? `${Math.floor(seconds / 60)}分${seconds % 60}秒` : `${seconds}秒`; const phase = activityText[session.activity || "preparing_context"] || "处理中"; const detail = latest ? summary(latest) : "正在准备下一步操作。"; const waitingForModel = ["waiting_model", "retrying_model"].includes(session.activity || ""); const plan = currentEvents.some((event) => ["plan", "plan_resumed"].includes(event.event_type)) ? session.plan ?? [] : []; return <article className="agent-working" aria-live="polite"><header><span className="working-pulse"><i /><i /><i /></span><div><strong>{phase}</strong><small>本阶段已用时 {elapsed}{waitingForModel && seconds >= 90 ? " · 模型响应较慢，RAgent 仍在等待" : ""}</small></div><b>受控执行</b></header><p>{detail}</p>{plan.length > 0 && <ol className="working-plan">{plan.map((item) => <li className={item.status} key={item.key}><span><b>{item.title}</b>{item.note && <small>{item.note}</small>}</span></li>)}</ol>}</article>; }
+function WorkingStatus({ session, events, now, runStartedAt }: { session: Session; events: Event[]; now: number; runStartedAt: number | null }) {
+  const boundary = events.reduce((last, event, index) => event.event_type === "user_message" || event.event_type === "steer_applied" ? index : last, -1);
+  const currentEvents = boundary >= 0 ? events.slice(boundary) : events;
+  const latest = currentEvents.at(-1);
+  const candidates = [runStartedAt, latest ? new Date(latest.created_at).getTime() : null, session.updated_at ? new Date(session.updated_at).getTime() : null].filter((value): value is number => value !== null && Number.isFinite(value) && value <= now);
+  const started = candidates.length ? Math.max(...candidates) : now;
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  const elapsed = seconds >= 60 ? `${Math.floor(seconds / 60)}分${seconds % 60}秒` : `${seconds}秒`;
+  const phase = activityText[session.activity || "preparing_context"] || "处理中";
+  const detail = latest ? summary(latest) : "正在准备下一步操作。";
+  const waitingForModel = ["waiting_model", "retrying_model"].includes(session.activity || "");
+  const plan = currentEvents.some((event) => ["plan", "plan_resumed"].includes(event.event_type)) ? session.plan ?? [] : [];
+  const completed = plan.filter((item) => item.status === "completed").length;
+  const currentStep = plan.find((item) => item.status === "in_progress");
+
+  return <article className="agent-working" aria-live="polite">
+    <header className="working-header">
+      <div><strong>{phase}</strong><small>本阶段已用时 {elapsed}</small></div>
+      <b>受控执行</b>
+    </header>
+    <div className="working-dashboard">
+      <div className="working-gauge" role="status" aria-label={`${phase}，已用时 ${elapsed}`}>
+        <span className="working-gauge-ring" aria-hidden="true" />
+        <div className="working-gauge-label"><strong>{phase}</strong><small>{elapsed}</small></div>
+      </div>
+      <div className="working-overview">
+        <div className="working-current"><span className="working-live-dot" aria-hidden="true" /><div><strong>{detail}</strong>{currentStep && <small>当前步骤 · {currentStep.title}</small>}</div></div>
+        <div className="working-stats">
+          <div><span>已完成步骤</span><strong>{completed}</strong></div>
+          <div><span>剩余步骤</span><strong>{plan.length - completed}</strong></div>
+        </div>
+      </div>
+    </div>
+    {waitingForModel && seconds >= 90 && <p className="working-slow-note">模型响应较慢，RAgent 仍在等待。</p>}
+    {plan.length > 0 && <details className="working-details"><summary>查看执行步骤 <span>{completed} / {plan.length}</span></summary><ol className="working-plan">{plan.map((item) => <li className={item.status} key={item.key}><span><b>{item.title}</b>{item.note && <small>{item.note}</small>}</span></li>)}</ol></details>}
+  </article>;
+}
 function MessageContent({ content }: { content: string }) { if (content.startsWith("任务完成\n\n")) return <CompletionResult content={content} />; if (content.startsWith("调用诊断\n\n")) return <DiagnosticResult content={content} />; return <div className="message-content"><Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeHighlight, { detect: false }]]} components={{ pre: CodeBlock }}>{content}</Markdown></div>; }
 function DiagnosticResult({ content }: { content: string }) { const sections = content.split(/\n{2,}/).slice(1).map((block) => { const [title, ...lines] = block.split("\n"); return { title, value: lines.join(" ").replace(/^\s*[-*]\s+/, "") }; }); const source = sections.find((item) => item.title === "判定来源"); return <div className="diagnostic-result"><header><div><strong>本次调用故障诊断</strong><small>{source?.value || "正在判断故障来源"}</small></div></header><div>{sections.filter((item) => item.title !== "判定来源").map((item) => <section key={item.title}><h4>{item.title}</h4><p>{item.value}</p></section>)}</div></div>; }
 function CompletionResult({ content }: { content: string }) { const blocks = content.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean); const sectionNames = new Set(["完成内容", "修改文件", "验证结果", "Git 状态", "改动规模"]); const sections: Array<{ title: string; values: string[] }> = []; const notes: string[] = []; for (const block of blocks.slice(1)) { const [first, ...rest] = block.split("\n"); const title = first.trim(); const value = rest.join("\n").trim(); if (sectionNames.has(title) && value) sections.push({ title, values: value.split("\n").map((line) => line.replace(/^\s*[-*]\s+/, "")).filter(Boolean) }); else notes.push(block); } const verification = sections.find((section) => section.title === "验证结果")?.values.join(" ") || ""; const verified = !/(?:未运行|未验证|跳过)/.test(verification); return <div className="completion-result"><header><span>✓</span><div><strong>任务已完成</strong><small>{verified ? "结果与验证证据已保存" : "结果与执行状态已保存"}</small></div></header><div className="completion-grid">{sections.map((section) => <section className={`completion-${section.title}`} key={section.title}><h4>{section.title}</h4>{section.values.map((value) => <div className="completion-item" key={`${section.title}-${value}`}><i>{section.title === "验证结果" ? (verified ? "✓" : "–") : section.title === "修改文件" || section.title === "Git 状态" ? "⌘" : "·"}</i><span>{value}</span></div>)}</section>)}</div>{notes.length > 0 && <footer>{notes.join(" ")}</footer>}</div>; }
 function SectionLabel({ children }: { children: React.ReactNode }) { return <div className="section-label">{children}</div>; }
-function summary(event: Event) { const p = event.payload; if (event.event_type === "model_response" && Array.isArray(p.tool_names)) { const names = p.tool_names.join(" → "); const targets = Array.isArray(p.tool_targets) ? p.tool_targets.filter(Boolean).join("；") : ""; const latency = Number(p.latency_ms || 0); return `工具：${names}${targets ? ` · 目标：${targets}` : ""} · ${String(p.protocol || "unknown")}${latency > 0 ? ` · ${latency} ms` : ""}`; } return String(p.summary || p.rationale || p.reason || "状态已保存"); }
 function contextMetrics(events: Event[], estimated: number, actual: number | null | undefined, currentLimit?: number, running = false) {
   const modelChange = events.slice().reverse().find((event) => event.event_type === "settings_updated" && event.payload.model_changed === true)?.sequence || 0;
   const prepared = events.slice().reverse().find((event) => event.sequence > modelChange && ["context_prepared", "context_compressed", "context_trimmed"].includes(event.event_type));

@@ -44,14 +44,14 @@ def test_successful_mutation_requests_follow_up_but_error_does_not() -> None:
     ) is TurnNext.CONTINUE
 
 
-def test_only_verified_complete_work_can_finish_without_another_model_call() -> None:
+def test_verified_work_returns_control_to_model_for_final_review() -> None:
     session = _session()
     session.turn_changed_files = ["app.py"]
     session.verification_passed = True
     assert next_after_tool(
         session, _decision(StudioAction.RUN_TESTS),
         verification_command=True, requirements_met=True,
-    ) is TurnNext.COMPLETE_VERIFIED
+    ) is TurnNext.CONTINUE
     assert next_after_tool(
         session, _decision(StudioAction.RUN_TESTS),
         verification_command=True, requirements_met=False,

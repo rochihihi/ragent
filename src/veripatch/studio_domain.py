@@ -112,6 +112,8 @@ class StudioTaskContract(BaseModel):
     intent_source: str = "deterministic"
     requires_clarification: bool = False
     allowed_actions: list[str] = Field(default_factory=list, max_length=40)
+    # Legacy persisted field; no longer used as a lexical authorization gate.
+    scope_actions: list[str] = Field(default_factory=list, max_length=40)
     denied_actions: list[str] = Field(default_factory=list, max_length=40)
     evidence_required: bool = False
     requirements: list[StudioRequirement] = Field(default_factory=list, max_length=20)
@@ -474,7 +476,7 @@ class StudioSession(BaseModel):
     task_state: StudioTaskState | None = None
     usage: UsageTotals = Field(default_factory=UsageTotals)
     plan: list[StudioPlanItem] = Field(default_factory=list)
-    turn_budget: int = 0
+    turn_budget: int | None = None
     review_completed: bool = False
     review_summary: str | None = None
     memory: StudioMemory = Field(default_factory=StudioMemory)
@@ -530,6 +532,7 @@ class SemanticIntentAssessment(BaseModel):
     intent: str = Field(pattern="^(answer|analysis|change|verify|launch_only|install|execute)$")
     confidence: str = Field(pattern="^(low|medium|high)$")
     requires_clarification: bool
+    launch_requested: bool = False
     clarification_question: str = Field(default="", max_length=500)
     rationale: str = Field(default="", max_length=500)
     dialogue_act: str = Field(default="instruction", max_length=80)

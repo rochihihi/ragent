@@ -34,7 +34,7 @@ def test_answer_review_does_not_replace_evidence_free_identity(tmp_path):
 @pytest.mark.parametrize("via_mcp", [False, True])
 @pytest.mark.parametrize("listing", [False, True])
 @pytest.mark.parametrize("empty", [False, True])
-def test_operation_answers_are_rendered_from_evidence(tmp_path, action, via_mcp, listing, empty):
+def test_operation_answers_preserve_model_text_and_audit_evidence(tmp_path, action, via_mcp, listing, empty):
     result = ([] if empty else ["app.py"]) if listing else {
         "path": "app.py", "content": "" if empty else "1: return a + b",
     }
@@ -59,8 +59,10 @@ def test_operation_answers_are_rendered_from_evidence(tmp_path, action, via_mcp,
     answer = session.messages[-1].content
     assert "尚不能确认" not in answer
     assert "invented purpose" not in answer
-    assert "UNSUPPORTED PROSE" not in answer
-    assert ("为空" if empty else "app.py") in answer
+    assert answer == decision.message
+    review = next(event for event in agent.store.events(session.session_id)
+                  if event["event_type"] == "claim_review")
+    assert review["payload"]["claims"][0]["source_matched"] is True
 
 
 @pytest.mark.parametrize("payload", [{}, {"tool": "list_tools", "result": []}])
@@ -75,7 +77,7 @@ def test_operation_claim_requires_recognized_evidence(tmp_path, payload):
         claims=[{"kind": "observation", "text": "app.py", "observation_id": 0}],
     )
     answer, audit = StudioAgent._render_claims(session, decision)
-    assert answer == "目前没有足够证据回答这个问题。"
+    assert answer == decision.message
     assert audit[0]["source_matched"] is False
 
 
@@ -112,9 +114,7 @@ def test_equivalent_file_observations_render_once_without_losing_audit(tmp_path,
 
     assert agent._execute(session, SafeWorkspace(tmp_path), decision)
     answer = session.messages[-1].content
-    assert answer.count("文件列表：") == 1
-    assert answer.count("app.py") == 1
-    assert "new.py" in answer
+    assert answer == decision.message
     reviews = [
         event
         for event in agent.store.events(session.session_id)
@@ -171,7 +171,7 @@ def test_file_listing_fallback_does_not_repeat_items_as_facts(tmp_path):
     )
 
     answer, audit = StudioAgent._render_claims(session, decision)
-    assert answer == "文件列表：\napp.py\ncalc.py"
+    assert answer == decision.message
     assert len(audit) == 3
 
 
@@ -202,7 +202,7 @@ def test_current_mcp_listing_replaces_historical_builtin_listing(tmp_path):
         ],
     )
     answer, audit = StudioAgent._render_claims(session, decision)
-    assert answer == "文件列表：\napp.py"
+    assert answer == decision.message
     assert len(audit) == 2
     assert all(item["source_matched"] for item in audit)
 
@@ -231,7 +231,7 @@ def test_mcp_tool_description_stays_in_audit_not_file_answer(tmp_path):
         ],
     )
     answer, audit = StudioAgent._render_claims(session, decision)
-    assert answer == "文件列表：\napp.py"
+    assert answer == decision.message
     assert len(audit) == 2
     assert audit[1]["text"].endswith(description + "”")
 
@@ -262,22 +262,22 @@ def test_file_evidence_is_transport_independent(tmp_path, via_mcp, listing):
         )
         answer, audit = StudioAgent._render_claims(session, decision)
         assert audit[0]["source_matched"] is supported
-        assert ("目前没有足够证据" not in answer) is supported
+        assert answer == decision.message
 
 
 @pytest.mark.parametrize("action", ["respond", "finish"])
 @pytest.mark.parametrize(
-    "kind,source,text,label",
+    "kind,source,text,supported",
     [
-        ("fact", 0, "probe", "中的原文"),
-        ("fact", 0, "用于上下文压缩", "目前没有足够证据"),
-        ("fact", 99, "probe", "目前没有足够证据"),
-        ("fact", 1, "用于上下文压缩", "目前没有足够证据"),
-        ("inference", 0, "可能用于压缩测试", "推测"),
-        ("unknown", None, "文件的真实用途", "目前没有足够证据"),
+        ("fact", 0, "probe", True),
+        ("fact", 0, "用于上下文压缩", False),
+        ("fact", 99, "probe", False),
+        ("fact", 1, "用于上下文压缩", False),
+        ("inference", 0, "可能用于压缩测试", None),
+        ("unknown", None, "文件的真实用途", None),
     ],
 )
-def test_answer_sources_on_both_response_routes(tmp_path, action, kind, source, text, label):
+def test_answer_sources_on_both_response_routes(tmp_path, action, kind, source, text, supported):
     session = StudioSession(
         session_id="claims",
         repo_root=str(tmp_path),
@@ -305,6 +305,6 @@ def test_answer_sources_on_both_response_routes(tmp_path, action, kind, source, 
     )
     assert agent._execute(session, SafeWorkspace(tmp_path), decision)
     answer = session.messages[-1].content
-    assert label in answer
-    assert "UNSUPPORTED PROSE" not in answer
-    assert any(e["event_type"] == "claim_review" for e in store.events(session.session_id))
+    assert answer == decision.message
+    review = next(e for e in store.events(session.session_id) if e["event_type"] == "claim_review")
+    assert review["payload"]["claims"][0]["source_matched"] is supported

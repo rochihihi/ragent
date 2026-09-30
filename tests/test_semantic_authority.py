@@ -97,7 +97,7 @@ def test_explicit_file_action_does_not_depend_on_semantic_classifier(tmp_path):
             ]
 
         async def classify_intent(self, messages, message):
-            pytest.fail("明确独立任务不应发起额外语义分类")
+            raise RuntimeError("classifier unavailable")
 
         async def decide(self, context):
             return StudioReply(

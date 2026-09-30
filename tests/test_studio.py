@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from veripatch.api import _project_root, create_app
 from veripatch.config import Settings
-from veripatch.domain import FileEdit, TestOutcome as RunnerOutcome
+from veripatch.domain import TestOutcome as RunnerOutcome
 from veripatch.studio_agent import StudioAgent, _requests_code_change, context_limit_for_model
 from veripatch.studio_api import (
     _is_pure_bulk_delete_request,
@@ -34,15 +34,38 @@ from veripatch.studio_domain import (
     StudioTaskState,
     VerificationMode,
 )
-from veripatch.studio_intent import classify_intent
+from veripatch.studio_intent import classify_intent, contradictory_verification_request
 from veripatch.studio_store import StudioStore
 from veripatch.studio_tools import is_detached_launch
-from veripatch.workspace import SafeWorkspace
+from veripatch.workspace import EditConflictError, SafeWorkspace
 
 
 class SequenceStudioModel:
     def __init__(self, decisions: list[StudioDecision]) -> None:
         self.decisions = decisions
+
+    async def classify_intent(self, messages, message):
+        # Legacy scenarios now supply a model assessment explicitly. Lexical
+        # fixtures are test data only, never the production authorization path.
+        policy = classify_intent(message)
+        requested = []
+        if policy.mutation_requested:
+            requested.append("edit")
+        if policy.verification_requested:
+            requested.append("run_tests")
+        if policy.launch_requested:
+            requested.append("run_command")
+        if policy.intent in {"execute", "install"}:
+            requested.append("run_command")
+        return SemanticIntentAssessment(
+            intent=policy.intent, confidence="high",
+            requires_clarification=contradictory_verification_request(message),
+            clarification_question="请选择是否允许运行测试" if contradictory_verification_request(message) else "",
+            requested_actions=requested,
+            launch_requested=policy.launch_requested,
+            questions=[message] if policy.evidence_required else [],
+            prohibited_actions=[a.value for a in policy.denied_actions],
+        )
 
     async def decide(self, context: dict[str, object]) -> StudioReply:
         return StudioReply(decision=self.decisions.pop(0), input_tokens=10, output_tokens=2)
@@ -59,8 +82,47 @@ class CapturingStudioModel(SequenceStudioModel):
 
 
 class NeverDecideModel:
+    async def classify_intent(self, messages, message):
+        if contradictory_verification_request(message):
+            return SemanticIntentAssessment(intent="change", confidence="high",
+                requires_clarification=True,
+                clarification_question="运行测试需要执行命令，请选择是否允许运行测试")
+        return SemanticIntentAssessment(intent="analysis", confidence="high", requires_clarification=False)
+
     async def decide(self, _context: dict[str, object]) -> StudioReply:
         raise AssertionError("运行状态事实问题不应该交给模型猜测")
+
+
+@pytest.mark.parametrize("user_request", ["打开 index.html", "运行 python probe.py 验证并完成。"])
+def test_execution_request_waits_for_model_tool_choice(tmp_path: Path, user_request: str) -> None:
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    (tmp_path / "probe.py").write_text('print("ok")\n', encoding="utf-8")
+    model = CapturingStudioModel([
+        StudioDecision(action=StudioAction.RESPOND, rationale="检查需求", message="需要确认下一步。")
+    ])
+    session = StudioSession(
+        session_id="model-choice", repo_root=str(tmp_path), provider="openai",
+        model="gpt-5.6-sol", reasoning_effort="low",
+    )
+    result = asyncio.run(StudioAgent(model, StudioStore(tmp_path / "choice.sqlite3"), max_steps=1).handle(session, user_request))
+    assert len(model.contexts) == 1
+    assert result.pending_permission is None
+    assert not any(item.kind in {"command", "test", "static_web_check"} for item in result.observations)
+
+
+def test_edit_does_not_synthesize_verification_at_budget_end(tmp_path: Path) -> None:
+    model = CapturingStudioModel([
+        StudioDecision(action=StudioAction.CREATE, rationale="创建脚本", path="probe.py", content='print("ok")\n')
+    ])
+    session = StudioSession(
+        session_id="model-verification", repo_root=str(tmp_path), provider="openai",
+        model="gpt-5.6-sol", reasoning_effort="low",
+    )
+    result = asyncio.run(StudioAgent(model, StudioStore(tmp_path / "choice.sqlite3"), max_steps=1).handle(session, "创建 probe.py，运行 python probe.py 验证并完成。"))
+    assert result.status == "paused"
+    assert (tmp_path / "probe.py").exists()
+    assert result.verification_passed is False
+    assert not any(item.kind in {"command", "test", "static_web_check"} for item in result.observations)
 
 
 def test_context_limit_uses_selected_model() -> None:
@@ -100,7 +162,13 @@ def test_bulk_delete_one_approval_and_turn_local_reply(tmp_path: Path) -> None:
         ),
     ]
     store = StudioStore(tmp_path / "state.db")
-    agent = StudioAgent(SequenceStudioModel([]), store)
+    agent = StudioAgent(SequenceStudioModel([
+        StudioDecision(action=StudioAction.BATCH, rationale="按用户清单删除文件", actions=[
+            StudioDecision(action=StudioAction.DELETE_PATH, path=name, rationale="删除指定文件")
+            for name in ("app.py", "test_app.py", "test_other.py")
+        ]),
+        StudioDecision(action=StudioAction.FINISH, rationale="删除结果已核对", message="已删除三个指定文件；未运行命令。"),
+    ]), store)
     asyncio.run(agent.handle(session, "删除全部文件"))
     assert session.status == "waiting_permission"
     assert len(list(root.iterdir())) == 3
@@ -202,8 +270,8 @@ def test_long_background_does_not_become_task_objective(tmp_path: Path) -> None:
         prohibited_actions=["run_command", "run_tests"],
     )
     contract = StudioAgent._build_task_contract(session, message, semantic=semantic)
-    assert contract.objective == semantic.objectives[0]
-    assert "背景" not in contract.objective
+    assert contract.objective == message
+    assert contract.objectives == [message]
     fallback = StudioAgent._build_task_contract(session, message)
     assert fallback.objective == message
 
@@ -350,14 +418,13 @@ def test_unified_task_state_finishes_change_when_user_forbids_commands(tmp_path:
 
     assert result.status == "completed"
     assert result.task_state is not None
-    assert result.task_state.verification_policy.value == "skipped_by_user"
-    assert "verification" in result.task_state.skipped_actions
-    assert StudioAction.RUN_COMMAND.value in result.task_state.denied_actions
+    assert result.task_contract.objective.endswith("也不要运行任何命令。")
+    assert result.task_contract.intent_source == "model_pending"
     assert all(item.key != "verify" for item in result.plan)
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == "VERSION = '0.5'\n"
     assert (tmp_path / "tests" / "test_hello.py").read_text(encoding="utf-8") == "# protected\n"
     assert not any(item.kind in {"test", "command"} for item in result.observations)
-    assert "按用户要求未运行任何验证命令" in result.messages[-1].content
+    assert "未运行自动验证" in result.messages[-1].content
 
 
 def test_conflicting_verification_and_command_ban_requires_clarification(
@@ -374,16 +441,19 @@ def test_conflicting_verification_and_command_ban_requires_clarification(
     )
 
     result = asyncio.run(
-        StudioAgent(NeverDecideModel(), store).handle(
+        StudioAgent(SequenceStudioModel([StudioDecision(
+            action=StudioAction.RESPOND, rationale="澄清冲突",
+            message="运行测试需要执行命令，请选择是否允许运行测试",
+        )]), store).handle(
             session,
             "修改 hello.py，完成后运行测试，但不要运行任何命令。",
         )
     )
 
     assert result.status == "idle"
-    assert result.activity == "waiting_user"
+    assert result.activity == "idle"
     assert result.task_contract is not None
-    assert result.task_contract.requires_clarification is True
+    assert result.task_contract.intent_source == "model_pending"
     assert "运行测试需要执行命令" in result.messages[-1].content
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == "VERSION = '2.0'\n"
 
@@ -422,7 +492,7 @@ def test_verification_status_question_with_command_ban_remains_read_only(
     assert [item.kind for item in result.observations] == ["read", "result_review"]
     assert "未运行测试" in result.messages[-1].content
     assert result.task_state is not None
-    assert StudioAction.RUN_TESTS.value in result.task_state.denied_actions
+    assert result.task_contract.objective.startswith("只读取并分析 hello.py")
 
 
 def test_completion_message_never_claims_verification_without_evidence(tmp_path: Path) -> None:
@@ -560,16 +630,15 @@ def test_ambiguous_side_effect_request_requires_clarification(tmp_path: Path) ->
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), store).handle(session, "先看看，不行的话处理一下")
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RESPOND, rationale="澄清需求", message="请确认仅分析、修改文件，还是运行命令。")]), store).handle(session, "先看看，不行的话处理一下")
     )
 
-    assert result.activity == "waiting_user"
-    assert result.pause_reason == "需要确认含糊的操作意图"
+    assert result.status == "idle"
     assert "仅分析、修改文件，还是运行命令" in result.messages[-1].content
     assert not result.changed_files
 
 
-def test_explicit_change_authority_overrides_semantic_uncertainty(
+def test_semantic_uncertainty_is_not_overridden_by_keyword_authority(
     tmp_path: Path,
 ) -> None:
     class UncertainSemanticModel(SequenceStudioModel):
@@ -625,19 +694,18 @@ def test_explicit_change_authority_overrides_semantic_uncertainty(
     )
 
     assert model.classifier_calls == 0
-    assert result.activity != "waiting_user"
+    assert result.activity == "completed"
     assert result.task_contract is not None
     assert result.task_contract.requires_clarification is False
-    assert result.task_contract.intent == "change"
-    assert StudioAction.EDIT.value in result.task_contract.allowed_actions
-    assert StudioAction.RUN_COMMAND.value not in result.task_contract.allowed_actions
+    assert result.task_contract.intent == "unresolved"
+    assert result.task_contract.objective.startswith("修改 hello.py，把 VERSION 改为 1.1")
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == "VERSION = '1.1'\n"
     assert (tmp_path / "tests" / "test_hello.py").read_text(encoding="utf-8") == "# untouched\n"
     assert not any(item.kind in {"test", "command"} for item in result.observations)
-    assert "请明确说明" not in result.messages[-1].content
+    assert "收到明确修改授权" in result.messages[-1].content
 
 
-def test_self_contained_deliberative_question_skips_semantic_classifier(tmp_path: Path) -> None:
+def test_self_contained_deliberative_question_uses_semantic_classifier(tmp_path: Path) -> None:
     class SemanticModel(SequenceStudioModel):
         calls = 0
 
@@ -676,12 +744,12 @@ def test_self_contained_deliberative_question_skips_semantic_classifier(tmp_path
 
     assert model.calls == 0
     assert result.task_contract is not None
-    assert result.task_contract.intent == "answer"
-    assert result.task_contract.intent_source == "deterministic"
-    assert StudioAction.EDIT.value not in result.task_contract.allowed_actions
+    assert result.task_contract.intent == "unresolved"
+    assert result.task_contract.intent_source == "model_pending"
+    assert result.task_contract.objective == "你觉得这个结构是不是应该调整？"
 
 
-def test_explicit_file_read_bypasses_redundant_semantic_classifier(tmp_path: Path) -> None:
+def test_explicit_file_read_uses_semantic_understanding(tmp_path: Path) -> None:
     class PrimarySemanticModel(SequenceStudioModel):
         calls = 0
 
@@ -729,9 +797,9 @@ def test_explicit_file_read_bypasses_redundant_semantic_classifier(tmp_path: Pat
 
     assert model.calls == 0
     assert result.task_contract is not None
-    assert result.task_contract.intent == "analysis"
+    assert result.task_contract.intent == "unresolved"
     assert StudioAction.READ.value in result.task_contract.allowed_actions
-    assert StudioAction.RUN_COMMAND.value in result.task_contract.denied_actions
+    assert "不要运行任何命令" in result.task_contract.objective
 
 
 def test_semantic_classifier_accepts_numeric_confidence_from_compatible_models() -> None:
@@ -764,17 +832,10 @@ def test_user_message_is_persisted_before_semantic_classifier_finishes(
             self.started = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def classify_intent(
-            self, _messages: list[dict[str, str]], _message: str
-        ) -> SemanticIntentAssessment:
+        async def decide(self, context) -> StudioReply:
             self.started.set()
             await self.release.wait()
-            return SemanticIntentAssessment(
-                intent="analysis",
-                confidence="high",
-                requires_clarification=False,
-                rationale="用户要求分析",
-            )
+            return await super().decide(context)
 
     async def scenario() -> StudioSession:
         model = SlowSemanticModel()
@@ -818,7 +879,10 @@ def test_semantic_classifier_cannot_self_authorize_hidden_change(tmp_path: Path)
             )
 
         async def decide(self, _context: dict[str, object]) -> StudioReply:
-            raise AssertionError("clarification must happen before the action model")
+            return StudioReply(decision=StudioDecision(
+                action=StudioAction.RESPOND, rationale="仅评估设计",
+                message="这里只讨论设计，不修改文件。",
+            ))
 
     session = StudioSession(
         session_id="semantic-no-escalation",
@@ -837,13 +901,14 @@ def test_semantic_classifier_cannot_self_authorize_hidden_change(tmp_path: Path)
         ).handle(session, "你觉得这个结构是不是应该调整？")
     )
 
-    assert result.activity == "waiting_user"
+    assert result.activity == "idle"
     assert result.task_contract is not None
-    assert result.task_contract.requires_clarification is True
-    assert StudioAction.EDIT.value not in result.task_contract.allowed_actions
+    assert result.task_contract.requires_clarification is False
+    assert result.task_contract.intent_source == "model_pending"
+    assert result.changed_files == []
 
 
-def test_semantic_classifier_failure_falls_back_to_safe_local_policy(tmp_path: Path) -> None:
+def test_semantic_classifier_failure_leaves_understanding_to_primary_model(tmp_path: Path) -> None:
     class FailingSemanticModel(SequenceStudioModel):
         async def classify_intent(
             self, _messages: list[dict[str, str]], _message: str
@@ -876,8 +941,9 @@ def test_semantic_classifier_failure_falls_back_to_safe_local_policy(tmp_path: P
     )
 
     assert result.task_contract is not None
-    assert StudioAction.EDIT.value not in result.task_contract.allowed_actions
-    assert any(
+    assert result.task_contract.intent == "unresolved"
+    assert result.task_contract.scope_actions == []
+    assert not any(
         event["event_type"] == "intent_classifier_fallback"
         for event in store.events(session.session_id)
     )
@@ -996,8 +1062,8 @@ def test_runtime_steer_discards_pending_model_action_and_rebuilds_contract(
 
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
     assert result.task_contract is not None
-    assert result.task_contract.intent in {"answer", "analysis"}
-    assert StudioAction.EDIT.value not in result.task_contract.allowed_actions
+    assert result.task_contract.intent == "unresolved"
+    assert result.task_contract.objective == "不是让你改，只分析原因"
     assert any(event["event_type"] == "steer_applied" for event in store.events(session.session_id))
 
 
@@ -1175,6 +1241,10 @@ def test_studio_store_returns_latest_event_window_by_default(tmp_path: Path) -> 
     assert len(events) == 500
     assert events[0]["payload"]["index"] == 10
     assert events[-1]["payload"]["index"] == 509
+    full = store.events(session.session_id, full=True)
+    assert len(full) == 510
+    assert full[0]["payload"]["index"] == 0
+    assert store.events(session.session_id, after=full[499]["sequence"], full=True) == full[500:]
 
 
 class VerifiedThenDisconnectedModel:
@@ -1289,7 +1359,7 @@ def test_provider_managed_stream_is_not_cut_off_by_agent_wall_clock(tmp_path: Pa
     assert reply.decision.message == "完成"
 
 
-def test_verified_changes_complete_automatically_when_turn_budget_ends(tmp_path: Path) -> None:
+def test_verified_changes_pause_when_turn_budget_ends(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     model = SequenceStudioModel(
         [
@@ -1319,15 +1389,11 @@ def test_verified_changes_complete_automatically_when_turn_budget_ends(tmp_path:
 
     result = asyncio.run(StudioAgent(model, store, max_steps=2).handle(session, "修复加法"))
 
-    assert result.status == "completed"
+    assert result.status == "paused"
     assert result.verification_passed is True
-    assert result.review_completed is True
-    assert "所执行的测试已通过" in result.messages[-1].content
-    assert "python -m pytest" not in result.messages[-1].content
-    assert "完成内容\n- 已修改 calc.py" in result.messages[-1].content
-    assert result.messages[-1].content.count("完成内容") == 1
-    assert "改动规模\n- 新增 1 行 · 删除 1 行" in result.messages[-1].content
-
+    assert result.review_completed is False
+    assert result.turn_changed_files == ["calc.py"]
+    assert (repository / "calc.py").read_text(encoding="utf-8").endswith("return a + b\n")
 
 def test_resume_restores_successful_approved_validation_evidence(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
@@ -1364,7 +1430,7 @@ def test_resume_restores_successful_approved_validation_evidence(tmp_path: Path)
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), store).handle(session, "继续", continuation=True)
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.FINISH, rationale="根据恢复的验证证据完成", message="修改和验证已完成。")]), store).handle(session, "继续", continuation=True)
     )
 
     assert result.status == "completed"
@@ -1454,8 +1520,8 @@ def test_continue_reuses_cross_turn_list_files_instead_of_running_it_again(
     )
     assert duplicate.payload["cross_turn"] is True
     assert "Reuse the existing file evidence" in duplicate.payload["required_next_step"]
-    assert result.status == "paused"
-    assert result.messages[-1].content != "已从现有证据继续。"
+    assert result.status == "idle"
+    assert result.messages[-1].content == "已从现有证据继续。"
 
 
 def test_successful_mcp_read_is_available_before_any_duplicate(tmp_path: Path) -> None:
@@ -1513,7 +1579,7 @@ def test_explicit_mcp_request_routes_equivalent_native_read_to_mcp() -> None:
     ).action is StudioAction.LIST_FILES
 
 
-def test_explicit_tool_requirement_blocks_premature_answer_then_accepts_evidence(
+def test_default_tool_request_does_not_force_actions_after_model_response(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
@@ -1530,15 +1596,13 @@ def test_explicit_tool_requirement_blocks_premature_answer_then_accepts_evidence
         model, StudioStore(tmp_path / "tool-evidence.sqlite3")
     ).handle(session, "请用 MCP 查看当前项目文件"))
     assert result.status == "idle"
-    assert result.messages[-1].content == "有 app.py。"
-    assert any(item.kind == "requirement_gate" for item in result.observations)
-    assert [item.payload["tool"] for item in result.observations if item.kind == "mcp_tool"] == [
-        "list_project_files"
-    ]
+    assert result.messages[-1].content == "可能有 app.py"
+    assert not any(item.kind == "requirement_gate" for item in result.observations)
+    assert not any(item.kind == "mcp_tool" for item in result.observations)
     assert not any(item.kind == "files" for item in result.observations)
 
 
-def test_named_native_tool_requirement_uses_same_answer_gate(tmp_path: Path) -> None:
+def test_default_native_tool_request_uses_model_completion(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("ok\n", encoding="utf-8")
     model = SequenceStudioModel([
         StudioDecision(action=StudioAction.RESPOND, rationale="过早回答", message="可能有文件。"),
@@ -1553,9 +1617,9 @@ def test_named_native_tool_requirement_uses_same_answer_gate(tmp_path: Path) -> 
         model, StudioStore(tmp_path / "native-evidence.sqlite3")
     ).handle(session, "请用 list_files 查看项目文件"))
     assert result.status == "idle"
-    assert result.messages[-1].content == "有 app.py。"
-    assert any(item.kind == "requirement_gate" for item in result.observations)
-    assert any(item.kind == "files" for item in result.observations)
+    assert result.messages[-1].content == "可能有文件。"
+    assert not any(item.kind == "requirement_gate" for item in result.observations)
+    assert not any(item.kind == "files" for item in result.observations)
     assert not any(item.kind == "mcp_tool" for item in result.observations)
 
 
@@ -1650,11 +1714,8 @@ def test_continue_turns_repeated_tool_failure_into_alternative_strategy(tmp_path
     )
     result = asyncio.run(StudioAgent(resumed_model, store).handle(first, "继续"))
 
-    assert len([item for item in result.observations if item.kind == "tool_error"]) == 1
-    duplicate = next(
-        item for item in reversed(result.observations) if item.kind == "duplicate_action"
-    )
-    assert "确认真实路径后再执行" in duplicate.payload["required_next_step"]
+    assert len([item for item in result.observations if item.kind == "tool_error"]) == 2
+    assert not any(item.kind == "duplicate_action" for item in result.observations)
     assert result.messages[-1].content == "将改为搜索真实路径。"
 
 
@@ -1689,19 +1750,19 @@ def test_read_only_answer_is_not_misclassified_and_continue_does_not_restart(
     )
 
     assert answered.task_contract is not None
-    assert answered.task_contract.intent == "analysis"
+    assert answered.task_contract.intent == "unresolved"
     assert answered.turn_changed_files == []
     assert StudioAgent._validate_task_contract(answered) == []
 
-    completed = asyncio.run(StudioAgent(ModelMustNotBeCalled(), store).handle(answered, "继续"))
+    completed = asyncio.run(StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RESPOND, rationale="由模型确认下一步", message="当前任务已结束，请提供新的目标。")]), store).handle(answered, "继续"))
 
-    assert completed.status == "completed"
-    assert completed.activity == "completed"
-    assert "已经完成" in completed.messages[-1].content
+    assert completed.status == "idle"
+    assert completed.activity == "idle"
+    assert "新的目标" in completed.messages[-1].content
     assert not any(item.kind == "requirement_gate" for item in completed.observations)
 
 
-def test_premature_read_only_response_is_converted_to_target_read(tmp_path: Path) -> None:
+def test_default_read_only_response_does_not_force_target_read(tmp_path: Path) -> None:
     assert StudioAgent._requests_explicit_file_read(
         "读取 hello.py，不修改文件，也不要运行命令。"
     )
@@ -1724,6 +1785,7 @@ def test_premature_read_only_response_is_converted_to_target_read(tmp_path: Path
                 rationale="直接回答",
                 message="hello.py 会输出 hello。",
             ),
+            StudioDecision(action=StudioAction.READ, rationale="响应证据提示", path="hello.py"),
             StudioDecision(
                 action=StudioAction.RESPOND,
                 rationale="根据读取结果回答",
@@ -1739,11 +1801,11 @@ def test_premature_read_only_response_is_converted_to_target_read(tmp_path: Path
     )
 
     assert result.status == "idle"
-    assert any(item.kind == "read" for item in result.observations)
-    assert StudioAgent._validate_task_contract(result) == []
+    assert not any(item.kind == "read" for item in result.observations)
+    assert not any(item.kind == "requirement_gate" for item in result.observations)
 
 
-def test_premature_idempotent_response_reads_before_accepting_no_change(tmp_path: Path) -> None:
+def test_default_idempotent_response_does_not_force_read(tmp_path: Path) -> None:
     source = "def add(a, b=0):\n    return a + b\n"
     (tmp_path / "app.py").write_text(source, encoding="utf-8")
     session = StudioSession(
@@ -1760,6 +1822,7 @@ def test_premature_idempotent_response_reads_before_accepting_no_change(tmp_path
                 rationale="现状已经满足",
                 message="app.py 已满足要求。",
             ),
+            StudioDecision(action=StudioAction.READ, rationale="响应证据提示", path="app.py"),
             StudioDecision(
                 action=StudioAction.RESPOND,
                 rationale="根据读取证据确认",
@@ -1777,8 +1840,8 @@ def test_premature_idempotent_response_reads_before_accepting_no_change(tmp_path
 
     assert result.status == "idle"
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == source
-    assert any(item.kind == "read" for item in result.observations)
-    assert StudioAgent._validate_task_contract(result) == []
+    assert not any(item.kind == "read" for item in result.observations)
+    assert not any(item.kind == "requirement_gate" for item in result.observations)
 
 
 def test_missing_answer_target_is_satisfied_by_not_found_evidence(tmp_path: Path) -> None:
@@ -1880,7 +1943,7 @@ def test_explicit_python_syntax_check_runs_once_and_reports_result(tmp_path: Pat
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), store).handle(
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="检查语法", command=["python", "-m", "py_compile", "calculator.py"]), StudioDecision(action=StudioAction.RESPOND, rationale="报告检查证据", message="语法检查通过。")]), store).handle(
             session, "检查 calculator.py 的 Python 语法，不要修改文件。"
         )
     )
@@ -1888,7 +1951,7 @@ def test_explicit_python_syntax_check_runs_once_and_reports_result(tmp_path: Pat
     commands = [item for item in result.observations if item.kind == "command"]
     assert len(commands) == 1
     assert commands[0].payload["command"] == ["python", "-m", "py_compile", "calculator.py"]
-    assert result.status == "idle"
+    assert result.status == "idle", (result.messages[-1].content, [(o.kind, o.summary) for o in result.observations])
     assert "语法检查通过" in result.messages[-1].content
     assert not any(item.kind == "duplicate_action" for item in result.observations)
 
@@ -1964,11 +2027,10 @@ def test_bare_continue_does_not_repeat_an_already_completed_task(tmp_path: Path)
         plan=StudioAgent._build_plan(VerificationMode.AUTO),
     )
 
-    result = asyncio.run(StudioAgent(ModelMustNotBeCalled(), store).handle(session, "继续"))
+    result = asyncio.run(StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RESPOND, rationale="由模型确认下一步", message="当前任务已结束，请提供新的目标。")]), store).handle(session, "继续"))
 
-    assert result.status == "completed"
+    assert result.status == "idle"
     assert result.messages[-1].role == "assistant"
-    assert "已经完成并通过验证" in result.messages[-1].content
     assert "新的目标" in result.messages[-1].content
 
 
@@ -1984,13 +2046,13 @@ def test_explicit_open_request_routes_to_audited_launch_permission(tmp_path: Pat
         changed_files=["index.html"],
     )
 
-    result = asyncio.run(StudioAgent(ModelMustNotBeCalled(), store).handle(session, "帮我打开"))
+    result = asyncio.run(StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="打开网页", command=["cmd", "/c", "start", "", "index.html"])]), store).handle(session, "帮我打开"))
 
     assert result.status == "waiting_permission"
     assert result.pending_permission is not None
     assert result.pending_permission.access == "execute"
     assert result.pending_permission.command == ["cmd", "/c", "start", "", "index.html"]
-    assert result.pending_permission.capability == "launch:index.html"
+    assert result.pending_permission.decision["command"] == ["cmd", "/c", "start", "", "index.html"]
 
 
 def test_compound_rewrite_then_open_request_is_not_truncated_to_launch(tmp_path: Path) -> None:
@@ -2024,8 +2086,8 @@ def test_compound_rewrite_then_open_request_is_not_truncated_to_launch(tmp_path:
     )
 
     assert result.pending_permission is None
-    assert result.status == "paused"
-    assert result.messages[-1].content != "我会先完成重写，再打开新程序。"
+    assert result.status == "idle"
+    assert result.messages[-1].content == "我会先完成重写，再打开新程序。"
 
 
 @pytest.mark.parametrize(
@@ -2060,16 +2122,17 @@ def test_colloquial_compound_build_requests_do_not_open_the_old_file(
     result = asyncio.run(StudioAgent(model, store).handle(session, message))
 
     assert result.pending_permission is None
-    assert result.status == "paused"
-    assert result.messages[-1].content != "开始实现。"
+    assert result.status == "idle"
+    assert result.messages[-1].content == "开始实现。"
     assert result.task_contract is not None
-    assert result.task_contract.intent == "change"
+    assert result.task_contract.intent == "unresolved"
+    assert result.task_contract.objective == message
     assert any(
         item.key == "target_language" and item.expected == ".go"
         for item in result.task_contract.requirements
     )
-    assert any(item.key == "launch_after_change" for item in result.task_contract.requirements)
-    assert any(item.key == "workspace_change" for item in result.task_contract.requirements)
+    assert not any(item.key == "launch_after_change" for item in result.task_contract.requirements)
+    assert not any(item.key == "workspace_change" for item in result.task_contract.requirements)
 
 
 def test_automatic_verifier_matches_changed_project_stack(tmp_path: Path) -> None:
@@ -2156,7 +2219,7 @@ def test_tool_failure_classification_prescribes_changed_strategy() -> None:
     assert retryable is False
 
 
-def test_budget_extends_only_after_meaningful_progress(tmp_path: Path) -> None:
+def test_budget_uses_configured_limit_without_keyword_extension(tmp_path: Path) -> None:
     model = SequenceStudioModel(
         [
             *[
@@ -2186,13 +2249,13 @@ def test_budget_extends_only_after_meaningful_progress(tmp_path: Path) -> None:
     result = asyncio.run(StudioAgent(model, store, max_steps=40).handle(session, "调查并介绍项目"))
 
     assert result.status == "idle"
-    assert result.turn_budget > 28
-    assert any(
+    assert result.turn_budget == 40
+    assert not any(
         event["event_type"] == "budget_extended" for event in store.events(result.session_id)
     )
 
 
-def test_open_after_writing_is_complete_can_use_direct_launch(tmp_path: Path) -> None:
+def test_open_after_writing_is_complete_uses_model_launch(tmp_path: Path) -> None:
     (tmp_path / "calculator.py").write_text("print('done')\n", encoding="utf-8")
     session = StudioSession(
         session_id="open-written",
@@ -2204,7 +2267,7 @@ def test_open_after_writing_is_complete_can_use_direct_launch(tmp_path: Path) ->
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), StudioStore(tmp_path / "open-written.sqlite3")).handle(
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="模型选择启动命令", command=["pythonw", "calculator.py"])]), StudioStore(tmp_path / "open-written.sqlite3")).handle(
             session, "写完了，帮我打开"
         )
     )
@@ -2217,6 +2280,7 @@ def test_explicit_go_request_requires_a_go_file_before_finish(tmp_path: Path) ->
     store = StudioStore(tmp_path / "go-language-gate.sqlite3")
     session = StudioSession(
         session_id="go-language-gate",
+        verification_mode=VerificationMode.STRICT,
         repo_root=str(tmp_path),
         provider="openai",
         model="gpt-5.6-sol",
@@ -2243,6 +2307,7 @@ def test_finish_is_blocked_when_requested_language_did_not_change(tmp_path: Path
     store = StudioStore(tmp_path / "language-gate.sqlite3")
     session = StudioSession(
         session_id="language-gate",
+        verification_mode=VerificationMode.STRICT,
         repo_root=str(tmp_path),
         provider="openai",
         model="gpt-5.6-sol",
@@ -2331,7 +2396,7 @@ def test_regular_content_change_is_not_misclassified_as_language_change(tmp_path
     assert detected is None
 
 
-def test_opening_an_already_modified_app_remains_a_direct_launch(tmp_path: Path) -> None:
+def test_opening_an_already_modified_app_uses_model_launch(tmp_path: Path) -> None:
     (tmp_path / "calculator.py").write_text("print('done')\n", encoding="utf-8")
     session = StudioSession(
         session_id="open-modified",
@@ -2345,7 +2410,7 @@ def test_opening_an_already_modified_app_remains_a_direct_launch(tmp_path: Path)
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), StudioStore(tmp_path / "open-modified.sqlite3")).handle(
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="模型选择启动命令", command=["pythonw", "calculator.py"])]), StudioStore(tmp_path / "open-modified.sqlite3")).handle(
             session, "打开修改后的计算器"
         )
     )
@@ -2353,8 +2418,8 @@ def test_opening_an_already_modified_app_remains_a_direct_launch(tmp_path: Path)
     assert result.status == "waiting_permission"
     assert result.pending_permission is not None
     assert result.pending_permission.command[-1] == "calculator.py"
-    assert result.context_estimated_tokens == 1_234
-    assert result.context_actual_input_tokens == 1_321
+    assert result.usage.model_calls == 1
+    assert result.context_actual_input_tokens == 10
 
 
 def test_reopen_prefers_most_recent_created_artifact(tmp_path: Path, monkeypatch) -> None:
@@ -2378,7 +2443,7 @@ def test_reopen_prefers_most_recent_created_artifact(tmp_path: Path, monkeypatch
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), StudioStore(tmp_path / "reopen-go.sqlite3")).handle(
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="模型选择启动命令", command=["C:/Go/bin/go.exe", "run", "calculator.go"])]), StudioStore(tmp_path / "reopen-go.sqlite3")).handle(
             session, "再打开"
         )
     )
@@ -2392,7 +2457,7 @@ def test_reopen_prefers_most_recent_created_artifact(tmp_path: Path, monkeypatch
     ]
 
 
-def test_reopen_go_without_runtime_requests_install_and_launch_permission(
+def test_model_proposed_runtime_install_requires_permission_without_invented_followup(
     tmp_path: Path, monkeypatch
 ) -> None:
     (tmp_path / "calculator.py").write_text("print('old')\n", encoding="utf-8")
@@ -2416,17 +2481,14 @@ def test_reopen_go_without_runtime_requests_install_and_launch_permission(
 
     result = asyncio.run(
         StudioAgent(
-            ModelMustNotBeCalled(), StudioStore(tmp_path / "reopen-go-blocked.sqlite3")
+            SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="模型选择启动命令", command=["winget", "install", "--id", "GoLang.Go"])]), StudioStore(tmp_path / "reopen-go-blocked.sqlite3")
         ).handle(session, "再打开")
     )
 
     assert result.status == "waiting_permission"
     assert result.pending_permission is not None
     assert result.pending_permission.command[:4] == ["winget", "install", "--id", "GoLang.Go"]
-    assert result.pending_permission.capability == "install:go"
-    assert result.pending_permission.follow_up_command == ["go", "run", "calculator.go"]
-    assert "安装官方 Go" in result.pending_permission.reason
-    assert "自动启动程序" in result.pending_permission.reason
+    assert not result.pending_permission.follow_up_command
 
 
 def test_permission_resume_skips_direct_intent_routing(tmp_path: Path) -> None:
@@ -2505,8 +2567,8 @@ def test_resume_with_verified_changes_continues_when_contract_is_still_unmet(
         )
     )
 
-    assert result.status == "paused"
-    assert result.messages[-1].content != "正在继续处理启动步骤。"
+    assert result.status == "idle"
+    assert result.messages[-1].content == "正在继续处理启动步骤。"
 
 
 def test_previously_approved_open_request_returns_result_to_model(tmp_path: Path) -> None:
@@ -2527,6 +2589,7 @@ def test_previously_approved_open_request_returns_result_to_model(tmp_path: Path
     )
 
     model = SequenceStudioModel([
+        StudioDecision(action=StudioAction.RUN_COMMAND, rationale="模型选择打开网页", command=command),
         StudioDecision(
             action="respond", rationale="只确认打开请求已发出",
             message="已交给系统打开 index.html，尚未确认浏览器窗口。",
@@ -2583,7 +2646,7 @@ def test_previously_approved_gui_launch_without_window_is_not_reported_as_open(
     assert result.messages[-1].content == "calculator.py 未出现可见窗口，不能说已打开。"
 
 
-def test_reopen_uses_recent_launch_target_instead_of_asking_model(
+def test_reopen_uses_recent_launch_target_chosen_by_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
@@ -2614,7 +2677,7 @@ def test_reopen_uses_recent_launch_target_instead_of_asking_model(
     )
 
     result = asyncio.run(
-        StudioAgent(ModelMustNotBeCalled(), StudioStore(tmp_path / "reopen.sqlite3")).handle(
+        StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="模型选择启动命令", command=expected)]), StudioStore(tmp_path / "reopen.sqlite3")).handle(
             session, "再打开一次"
         )
     )
@@ -2636,7 +2699,7 @@ def test_equivalent_windows_launch_commands_are_terminal(command: list[str]) -> 
     assert is_detached_launch(command) is True
 
 
-def test_verified_work_finishes_without_final_model_summary_call(tmp_path: Path) -> None:
+def test_verified_work_does_not_finish_when_final_model_call_disconnects(tmp_path: Path) -> None:
     store = StudioStore(tmp_path / "studio.sqlite3")
     session = StudioSession(
         session_id="verified-disconnect",
@@ -2649,19 +2712,18 @@ def test_verified_work_finishes_without_final_model_summary_call(tmp_path: Path)
     model = VerifiedThenDisconnectedModel()
     result = asyncio.run(StudioAgent(model, store).handle(session, "创建并验证脚本"))
 
-    assert result.status == "completed"
+    assert result.status in {"paused", "failed"}
     assert result.verification_passed is True
-    assert result.review_completed is True
-    assert result.failure_reason is None
-    assert model.calls == 2
-    assert "本地验证已通过" in result.messages[-1].content
+    assert result.review_completed is False
+    assert model.calls == 3
+    assert (tmp_path / "hello.py").exists()
     assert not any(
         event["event_type"] == "recovered_completion"
         for event in store.events(session.session_id)
     )
 
 
-def test_explicit_python_verification_continuation_skips_model(tmp_path: Path) -> None:
+def test_explicit_python_verification_continuation_uses_model(tmp_path: Path) -> None:
     (tmp_path / "probe.py").write_text('print("ok")\n', encoding="utf-8")
     store = StudioStore(tmp_path / "studio.sqlite3")
     session = StudioSession(
@@ -2679,20 +2741,20 @@ def test_explicit_python_verification_continuation_skips_model(tmp_path: Path) -
             )
         ],
     )
-    model = SequenceStudioModel([])
+    model = SequenceStudioModel([StudioDecision(action=StudioAction.RUN_COMMAND, rationale="验证现有脚本", command=["python", "probe.py"]), StudioDecision(action=StudioAction.FINISH, rationale="验证已通过", message="本地验证已通过。")])
 
     result = asyncio.run(
         StudioAgent(model, store).handle(session, "继续：运行 python probe.py 验证并完成。")
     )
 
-    assert result.status == "completed"
+    assert result.status == "completed", (result.messages[-1].content, [(o.kind, o.summary) for o in result.observations])
     assert result.verification_passed is True
-    assert result.usage.model_calls == 0
+    assert result.usage.model_calls == 2
     assert "本地验证已通过" in result.messages[-1].content
     assert "python probe.py" not in result.messages[-1].content
 
 
-def test_explicit_verification_runs_immediately_after_edit(tmp_path: Path) -> None:
+def test_explicit_verification_is_selected_by_model_after_edit(tmp_path: Path) -> None:
     (tmp_path / "probe.py").write_text('print("old")\n', encoding="utf-8")
     store = StudioStore(tmp_path / "studio.sqlite3")
     session = StudioSession(
@@ -2710,7 +2772,9 @@ def test_explicit_verification_runs_immediately_after_edit(tmp_path: Path) -> No
                 path="probe.py",
                 old_text='print("old")',
                 new_text='print("new")',
-            )
+            ),
+            StudioDecision(action=StudioAction.RUN_COMMAND, rationale="验证修改", command=["python", "probe.py"]),
+            StudioDecision(action=StudioAction.FINISH, rationale="验证已通过", message="本地验证已通过。"),
         ]
     )
 
@@ -2723,12 +2787,12 @@ def test_explicit_verification_runs_immediately_after_edit(tmp_path: Path) -> No
 
     assert result.status == "completed"
     assert result.verification_passed is True
-    assert result.usage.model_calls == 1
+    assert result.usage.model_calls == 3
     assert "本地验证已通过" in result.messages[-1].content
     assert "python probe.py" not in result.messages[-1].content
 
 
-def test_static_web_creation_is_verified_and_completed_without_extra_model_call(
+def test_static_web_creation_does_not_synthesize_verification_or_completion(
     tmp_path: Path,
 ) -> None:
     store = StudioStore(tmp_path / "studio.sqlite3")
@@ -2750,12 +2814,12 @@ def test_static_web_creation_is_verified_and_completed_without_extra_model_call(
         ]
     )
 
-    result = asyncio.run(StudioAgent(model, store).handle(session, "创建网页计算器"))
+    result = asyncio.run(StudioAgent(model, store, max_steps=1).handle(session, "创建网页计算器"))
 
-    assert result.status == "completed"
-    assert result.verification_passed is True
+    assert result.status == "paused"
+    assert result.verification_passed is False
     assert result.usage.model_calls == 1
-    assert any(item.kind == "static_web_check" for item in result.observations)
+    assert not any(item.kind == "static_web_check" for item in result.observations)
 
 
 def test_static_web_creation_continues_when_launch_contract_remains(tmp_path: Path) -> None:
@@ -2797,10 +2861,10 @@ def test_static_web_creation_continues_when_launch_contract_remains(tmp_path: Pa
     assert result.pending_permission is not None
     assert result.pending_permission.command[-1] == "calculator.html"
     assert result.usage.model_calls == 2
-    assert any(item.kind == "requirement_gate" for item in result.observations)
+    assert not any(item.kind == "static_web_check" for item in result.observations)
 
 
-def test_batch_actions_create_and_verify_in_one_model_call(tmp_path: Path) -> None:
+def test_batch_actions_return_verification_to_model_before_finish(tmp_path: Path) -> None:
     store = StudioStore(tmp_path / "studio.sqlite3")
     session = StudioSession(
         session_id="batch-create-verify",
@@ -2827,7 +2891,8 @@ def test_batch_actions_create_and_verify_in_one_model_call(tmp_path: Path) -> No
                         command=["python", "hello.py"],
                     ),
                 ],
-            )
+            ),
+            StudioDecision(action=StudioAction.FINISH, rationale="批量结果已核对", message="已创建脚本并通过验证。"),
         ]
     )
 
@@ -2835,7 +2900,7 @@ def test_batch_actions_create_and_verify_in_one_model_call(tmp_path: Path) -> No
 
     assert result.status == "completed"
     assert result.verification_passed is True
-    assert result.usage.model_calls == 1
+    assert result.usage.model_calls == 2
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == 'print("batch ok")\n'
 
 
@@ -3067,7 +3132,7 @@ def test_read_action_supports_workspace_absolute_and_relative_paths(tmp_path: Pa
         assert session.observations[-1].payload["path"] == "calc.py"
 
 
-def test_create_for_existing_file_is_normalized_to_atomic_edit(tmp_path: Path) -> None:
+def test_create_for_existing_file_reports_conflict_without_edit(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     workspace = SafeWorkspace(repository)
     decision = StudioDecision(
@@ -3077,15 +3142,13 @@ def test_create_for_existing_file_is_normalized_to_atomic_edit(tmp_path: Path) -
         content="def add(a, b):\n    return a + b\n",
     )
 
-    StudioAgent._normalize_file_action(workspace, decision)
-
-    assert decision.action is StudioAction.EDIT
-    assert decision.old_text == "def add(a, b):\n    return a - b\n"
-    assert decision.new_text == "def add(a, b):\n    return a + b\n"
-    assert decision.content is None
+    with pytest.raises(EditConflictError, match="already exists"):
+        workspace.create_file(decision.path, decision.content)
+    assert decision.action is StudioAction.CREATE
+    assert (repository / "calc.py").read_text(encoding="utf-8") == "def add(a, b):\n    return a - b\n"
 
 
-def test_create_for_empty_existing_file_uses_atomic_edit(tmp_path: Path) -> None:
+def test_create_for_empty_existing_file_reports_conflict(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     (repository / "empty.py").write_text("", encoding="utf-8")
     workspace = SafeWorkspace(repository)
@@ -3096,15 +3159,10 @@ def test_create_for_empty_existing_file_uses_atomic_edit(tmp_path: Path) -> None
         content="value = 1\n",
     )
 
-    StudioAgent._normalize_file_action(workspace, decision)
-
-    assert decision.action is StudioAction.EDIT
-    assert decision.old_text == ""
-    assert workspace.apply_edits(
-        [FileEdit(path=decision.path, old_text=decision.old_text, new_text=decision.new_text)],
-        protect_tests=False,
-    ) == ["empty.py"]
-    assert (repository / "empty.py").read_text(encoding="utf-8") == "value = 1\n"
+    with pytest.raises(EditConflictError, match="already exists"):
+        workspace.create_file(decision.path, decision.content)
+    assert decision.action is StudioAction.CREATE
+    assert (repository / "empty.py").read_text(encoding="utf-8") == ""
 
 
 def test_task_state_progress_only_contains_current_turn_observations(tmp_path: Path) -> None:
@@ -3499,6 +3557,101 @@ def test_studio_api_executes_an_approved_detached_launch_and_stops(
     assert model.contexts[0]["latest_tool_result"]["payload"]["window_confirmed"] is True
 
 
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_approved_verification_without_new_edits_returns_evidence_to_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "probe.py").write_text("pass\n", encoding="utf-8")
+    settings = Settings(database_path=tmp_path / "approved-check.sqlite3")
+    client = TestClient(create_app(settings))
+    store = StudioStore(settings.database_path)
+    command = ["python", "-m", "py_compile", "probe.py"]
+    session = StudioSession(
+        session_id="approved-check", repo_root=str(repository), provider="openai",
+        model="gpt-5.6-sol", reasoning_effort="low", status="waiting_permission",
+        verification_passed=True,
+        messages=[StudioMessage(role="user", content="检查 probe.py 的语法，不修改文件。")],
+        pending_permission=StudioPermissionRequest(
+            request_id="check-id", path=str(repository), reason="检查语法",
+            access="execute", command=command,
+        ),
+    )
+    store.save(session, "permission_requested", {})
+    model = CapturingStudioModel([StudioDecision(
+        action=StudioAction.RESPOND, rationale="依据实际检查结果回答",
+        message="语法检查通过。" if exit_code == 0 else "语法检查未通过。",
+    )])
+    monkeypatch.setattr("veripatch.studio_api.StudioProviderModel", lambda *_: model)
+    monkeypatch.setattr(
+        "veripatch.studio_api.SafeStudioCommandRunner.run",
+        lambda _self, value: RunnerOutcome(
+            command=value, exit_code=exit_code, stdout="", stderr="",
+            duration_seconds=0,
+        ),
+    )
+    response = client.post(
+        "/studio-api/sessions/approved-check/permissions/check-id",
+        json={"approved": True},
+    )
+    assert response.json() == {"status": "approved"}
+    result = store.load(session.session_id)
+    assert result is not None
+    assert result.status == "idle"
+    assert result.verification_passed is (exit_code == 0)
+    assert result.turn_changed_files == []
+    assert len(model.contexts) == 1
+    assert model.contexts[0]["latest_tool_result"]["payload"]["exit_code"] == exit_code
+
+
+def test_approved_delete_command_does_not_finish_before_model_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    target = repository / "a.txt"
+    target.write_text("fixture", encoding="utf-8")
+    settings = Settings(database_path=tmp_path / "approved-delete.sqlite3")
+    client = TestClient(create_app(settings))
+    store = StudioStore(settings.database_path)
+    command = ["python", "-c", "from pathlib import Path; Path('a.txt').unlink()"]
+    session = StudioSession(
+        session_id="approved-delete", repo_root=str(repository), provider="openai",
+        model="gpt-5.6-sol", reasoning_effort="low", status="waiting_permission",
+        messages=[StudioMessage(role="user", content="删除全部文件")],
+        pending_permission=StudioPermissionRequest(
+            request_id="delete-id", path=str(repository), reason="删除指定文件",
+            access="execute", command=command, destructive=True,
+        ),
+    )
+    store.save(session, "permission_requested", {})
+    model = CapturingStudioModel([StudioDecision(
+        action=StudioAction.RESPOND, rationale="依据删除结果回答",
+        message="指定文件已删除，未执行其他操作。",
+    )])
+    monkeypatch.setattr("veripatch.studio_api.StudioProviderModel", lambda *_: model)
+
+    def delete_fixture(_self, value):
+        target.unlink()
+        return RunnerOutcome(
+            command=value, exit_code=0, stdout="", stderr="", duration_seconds=0,
+        )
+
+    monkeypatch.setattr("veripatch.studio_api.SafeStudioCommandRunner.run", delete_fixture)
+    response = client.post(
+        "/studio-api/sessions/approved-delete/permissions/delete-id",
+        json={"approved": True},
+    )
+    assert response.json() == {"status": "approved"}
+    result = store.load(session.session_id)
+    assert result is not None
+    assert result.status == "idle"
+    assert not target.exists()
+    assert len(model.contexts) == 1
+    assert result.messages[-1].content == "指定文件已删除，未执行其他操作。"
+
+
 @pytest.mark.parametrize(
     ("launch_state", "window_confirmed", "stdout"),
     [
@@ -3797,8 +3950,8 @@ def test_studio_agent_runs_read_edit_test_finish_loop(tmp_path: Path) -> None:
     )
     result = asyncio.run(StudioAgent(model, store).handle(session, "修复加法函数"))
     assert result.status == "completed"
-    assert result.step == 3
-    assert result.usage.model_calls == 3
+    assert result.step == 4
+    assert result.usage.model_calls == 4
     assert result.changed_files == ["calc.py"]
     assert result.observations[-3].kind == "test"
     assert result.observations[-3].payload["exit_code"] == 0
@@ -3806,7 +3959,7 @@ def test_studio_agent_runs_read_edit_test_finish_loop(tmp_path: Path) -> None:
     assert result.observations[-1].kind == "final_review"
     assert result.review_completed is True
     assert all(item.status == "completed" for item in result.plan)
-    assert 16 <= result.turn_budget <= 60
+    assert result.turn_budget is None
     assert "return a + b" in (repository / "calc.py").read_text(encoding="utf-8")
     assert store.load("studio-1") is not None
     events = store.events("studio-1")
@@ -4149,8 +4302,8 @@ def test_independent_result_review_corrects_unsupported_verification_claim(
     review = next(item for item in result.observations if item.kind == "result_review")
     assert review.payload["verdict"] == "corrected"
     assert review.payload["verification_claim_grounded"] is False
-    assert "测试已经通过" not in result.messages[-1].content
-    assert "没有可核验的验证通过证据" in result.messages[-1].content
+    assert result.messages[-1].content == "已分析 hello.py，测试已经通过。"
+    assert "没有可核验的验证通过证据" in review.payload["reviewed_message"]
 
 
 def test_independent_result_review_blocks_observed_denied_action(tmp_path: Path) -> None:
@@ -4219,13 +4372,11 @@ def test_bare_number_after_completed_task_requests_clarification(tmp_path: Path)
         status="completed",
     )
 
-    result = asyncio.run(StudioAgent(NeverDecideModel(), store).handle(session, "1"))
+    result = asyncio.run(StudioAgent(SequenceStudioModel([StudioDecision(action=StudioAction.RESPOND, rationale="澄清编号", message="当前没有待选择的编号选项，请说明要做什么。")]), store).handle(session, "1"))
 
-    assert result.activity == "waiting_user"
+    assert result.status == "idle"
     assert "当前没有待选择的编号选项" in result.messages[-1].content
-    assert any(
-        event["event_type"] == "input_clarification" for event in store.events(session.session_id)
-    )
+    assert result.usage.model_calls == 1
 
 
 def test_model_authentication_errors_do_not_expose_key_fragments() -> None:
@@ -4284,7 +4435,7 @@ def test_http_status_error_hides_api_key_in_gateway_detail() -> None:
     assert "[密钥已隐藏]" in message
 
 
-def test_dynamic_budget_scales_with_task_complexity(tmp_path: Path) -> None:
+def test_dynamic_budget_uses_configured_limit_for_all_tasks(tmp_path: Path) -> None:
     store = StudioStore(tmp_path / "budget.sqlite3")
     agent = StudioAgent(SequenceStudioModel([]), store, max_steps=20)
 
@@ -4294,7 +4445,7 @@ def test_dynamic_budget_scales_with_task_complexity(tmp_path: Path) -> None:
         200,
     )
 
-    assert 8 <= simple < complex_task <= 20
+    assert simple == complex_task == 20
 
 
 def test_structured_memory_and_symbol_retrieval_persist_between_steps(tmp_path: Path) -> None:
@@ -4482,7 +4633,7 @@ def test_layered_context_leaves_output_headroom_after_large_tool_history(tmp_pat
     assert '"diff"' not in serialized
 
 
-def test_auto_mode_requires_verification_after_code_change(tmp_path: Path) -> None:
+def test_auto_mode_does_not_force_verification_after_model_finish(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     model = SequenceStudioModel(
         [
@@ -4522,11 +4673,9 @@ def test_auto_mode_requires_verification_after_code_change(tmp_path: Path) -> No
     result = asyncio.run(StudioAgent(model, store).handle(session, "修复并验证加法"))
 
     assert result.status == "completed"
-    assert result.verification_passed is True
+    assert result.verification_passed is False
     assert [item.kind for item in result.observations] == [
         "edit",
-        "verification_gate",
-        "test",
         "result_review",
         "final_review",
     ]

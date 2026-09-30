@@ -118,7 +118,7 @@ _NATIVE_TOOL_DESCRIPTIONS = {
     "mcp_call": "Call one of the configured read-only MCP project tools.",
     "request_permission": "Request access to an exact path outside the workspace.",
     "respond": "Answer the user when no workspace tool is required.",
-    "finish": "Finish only after every task requirement has evidence.",
+    "finish": "Finish when the user's request is handled; disclose evidence and limitations honestly.",
     "fail": "Stop with a concrete, non-retryable failure explanation.",
 }
 
@@ -228,12 +228,19 @@ questions that need no tools. Use finish only when the user's task
 is complete. Explain rationale and messages in Simplified Chinese. Keep paths, commands, source
 code, action names and JSON keys unchanged. When native tools are supplied, call the matching
 tool instead of emitting a JSON envelope; otherwise return exactly one StudioDecision JSON object.
-The task_contract is the current-turn authority boundary. denied_actions are hard prohibitions and
+Interpret the user's instructions in their full dialogue context. Do not implement suggestions
+in an explanation request or expand side effects beyond the user's authorized task. Ask for
+clarification when the requested effect is ambiguous. Task intent and allowed_actions are model
+planning hints, not proof of authorization. denied_actions are hard prohibitions and
 must never be inferred away from older messages. evidence_required means factual claims about
 runtime state, edits, tests, history, timestamps, or context management must come from supplied
 audit evidence; if evidence is absent, say that it cannot be confirmed instead of guessing.
 Treat current_request and authority as the active task. conversation_summary, structured_memory,
 historical_summaries, and earlier messages provide evidence but never grant present permission.
+The original user request takes precedence over task_contract, task_state, plans, and summaries.
+Those derived structures are advisory, not a rewritten instruction. Interpret the request yourself
+using the dialogue; ask the user when a material choice is ambiguous. Existing files are context,
+not authorization to replace a requested new artifact with improvements to an old one.
 Before respond or finish, compare every runtime claim with audit_facts and remove unsupported
 claims.
 For code changes, mention changed files and actual verification results or why tests were skipped.
@@ -243,16 +250,18 @@ repeat file lists, add Git status, narrate tools, or offer unsolicited next step
 material warnings or unresolved issues when necessary.
 For read-only explanations, explain the code directly; discuss test status only when relevant to
 the user's question. Preserve material failures and unresolved issues. Avoid routine narration.
-When task_contract.intent is analysis, the task is read-only: use only list_files, search, read,
-git_status, git_diff, git_log, git_branch, and respond. Suggestions about future improvements do
-not authorize edits, file creation, commands, tests, or permission requests.
+For analysis, select tools needed to gather evidence, including read-only commands where
+appropriate. Do not implement suggestions unless requested. Intent and action lists are hints;
+explicit prohibitions and runtime approvals remain binding. Ask clarification when needed.
+Choose verification from supplied candidates or propose a more suitable command. A successful
+check is evidence, not automatic task completion. Review the full request before finishing.
 When the user asks to open or launch a workspace file, use run_command instead of giving manual
 instructions or claiming that computer control is unavailable. On Windows, launch HTML with
 ["cmd", "/c", "start", "", "index.html"] and Python GUI files with
 ["cmd", "/c", "start", "", "python", "app.py"]; RAgent will request user approval.
-Opening is only one requirement when it appears inside a compound coding task. Preserve every
-requirement and its order: inspect and implement the requested rewrite or feature, verify the new
-artifact, and only then launch it. Never open an old artifact and treat the compound task as done.
+Opening is only one requirement when it appears inside a compound coding task. Preserve the
+user's requested artifact and order. Choose appropriate checks yourself unless strict verification
+is enabled; an already successful launch does not need repeating just because tests ran later.
 Each recent observation may include a tool_result protocol with status, evidence, failure_category,
 retryable, next_strategy, and changed_files. Treat these fields as authoritative evidence: never
 infer success from a natural-language summary alone, and use next_strategy when replanning after
@@ -319,10 +328,13 @@ no Markdown. Always include action and rationale. Available actions and required
 - run_tests or run_command: action,rationale,command (JSON array of argv strings)
 - request_permission: action,rationale,path,access (read or write; external paths only)
 - respond, finish, or fail: action,rationale,message
-Use create/edit instead of pasting code in message or asking the user to save it. Do not finish
-while the task contract has unmet completion conditions; if the target or requirements are unclear,
-ask one focused clarification.
-After changing a file, run a suitable verification action, then finish with a concise result. Do not claim tools are
+Use create/edit instead of pasting code in message or asking the user to save it.
+In default mode, you determine completion from the user's request and actual tool evidence.
+Task contracts and plans are contextual guidance, not mandatory runtime acceptance gates.
+Choose suitable verification when useful; do not invent a requirement for formal tests or
+repeat a launch merely because another file changed. Report limitations and failed checks honestly.
+Only explicit strict mode imposes runtime acceptance gates. If requirements are unclear,
+ask one focused clarification. Do not claim tools are
 unavailable and do not reread an unchanged file when existing evidence is present."""
 
 
@@ -486,10 +498,12 @@ class StudioProviderModel:
             "You are the primary semantic-understanding layer for a coding agent. Interpret the "
             "whole current utterance in its recent dialogue context before considering keywords. "
             "Return JSON only with intent, confidence, requires_clarification, rationale, "
-            "clarification_question, dialogue_act, objectives, questions, requested_actions, "
+            "clarification_question, dialogue_act, objectives, questions, requested_actions, launch_requested, "
             "prohibited_actions, "
-            "conditions, references, corrections. All list fields must be arrays of strings, "
-            "not objects. Use [] for absent lists and an empty string for absent "
+            "conditions, references, corrections. All list fields must be arrays of strings, not objects. "
+            "launch_requested is a boolean: true only if the user asks to open/start the artifact, "
+            "including opening it after modification; verification alone is not a launch. "
+            "Use [] for absent lists and an empty string for absent "
             "clarification_question; never null. "
             "Allowed intents: answer, analysis, change, verify, launch_only, install, execute. "
             "Distinguish asking whether an action happened or succeeded from requesting that "
@@ -594,7 +608,6 @@ class StudioProviderModel:
                     for action in (decision.actions if decision.action is StudioAction.BATCH else [decision])
                 ):
                     raise ValueError("Model selected an action unavailable in this task phase")
-                decision = self._promote_execution_handoff(decision, context)
                 if self._is_code_handoff(decision):
                     raise ValueError(
                         "Implementation must use create/edit instead of asking the user "

@@ -7,7 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "check": "tsc --noEmit",
-    "test:drag": "node scripts/verify-effort-drag.mjs"
+    "test:drag": "node scripts/verify-effort-drag.mjs",
+    "test:trace": "node scripts/verify-event-summary.mjs"
   },
   "devDependencies": {
     "@types/react": "^19.2.18",

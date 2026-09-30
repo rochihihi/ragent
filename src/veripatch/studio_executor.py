@@ -231,7 +231,6 @@ class StudioActionExecutor:
         changed = self.record_command_effects(session, workspace, before)
         if (
             session.verification_mode.value == "auto"
-            and session.turn_changed_files
             and execution.role == "verification"
         ):
             session.verification_passed = outcome.passed

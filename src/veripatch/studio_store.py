@@ -160,9 +160,15 @@ class StudioStore:
             connection.execute("DELETE FROM studio_sessions WHERE session_id=?", (session_id,))
         return True
 
-    def events(self, session_id: str, after: int = 0) -> list[dict[str, Any]]:
+    def events(self, session_id: str, after: int = 0, *, full: bool = False) -> list[dict[str, Any]]:
         with self._connection() as connection:
-            if after:
+            if full:
+                rows = connection.execute(
+                    """SELECT sequence,event_type,payload_json,created_at FROM studio_events
+                    WHERE session_id=? AND sequence>? ORDER BY sequence""",
+                    (session_id, after),
+                ).fetchall()
+            elif after:
                 rows = connection.execute(
                     """SELECT sequence,event_type,payload_json,created_at FROM studio_events
                     WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 500""",

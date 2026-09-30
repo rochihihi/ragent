@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 from collections.abc import Callable
+from itertools import count
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -46,6 +47,7 @@ from veripatch.studio_execution import (
     launch_effect_satisfied,
     launch_window_confirmed,
 )
+from veripatch.studio_executor import StudioActionExecutor
 from veripatch.studio_harness import (
     ActionLedger,
     TaskEvidence,
@@ -54,29 +56,24 @@ from veripatch.studio_harness import (
 )
 from veripatch.studio_intent import (
     IntentPolicy,
-    ambiguous_side_effect_request,
     classify_intent,
-    contradictory_verification_request,
-    denied_action_reason,
     is_contextual_continuation,
+    model_intent_policy,
     requests_code_change,
-    semantic_policy,
 )
 from veripatch.studio_permissions import fingerprint as approval_fingerprint
 from veripatch.studio_permissions import requires_approval, session_grant_matches
-from veripatch.studio_store import StudioStore
 from veripatch.studio_runtime import StudioExecutionRuntime
-from veripatch.studio_executor import StudioActionExecutor
-from veripatch.studio_turn import TurnNext, next_after_tool
+from veripatch.studio_store import StudioStore
 from veripatch.studio_tools import (
     TERMINALS,
     SafeStudioCommandRunner,
     UnsafeStudioCommand,
-    command_capability,
     command_permission_details,
     detect_project,
     is_detached_launch,
 )
+from veripatch.studio_turn import TurnNext, next_after_tool
 from veripatch.testing import studio_pytest_runner
 from veripatch.verification_discovery import discover_verification
 from veripatch.workspace import SafeWorkspace
@@ -84,6 +81,10 @@ from veripatch.workspace import SafeWorkspace
 
 class StudioModel(Protocol):
     async def decide(self, context: dict[str, object]) -> StudioReply: ...
+
+
+class UserPauseRequested(Exception):
+    """Cooperative stop before starting the next side effect."""
 
 
 DEFAULT_CONTEXT_LIMIT = 16_000
@@ -159,15 +160,17 @@ class StudioAgent:
         model: StudioModel,
         store: StudioStore,
         *,
-        max_steps: int = 60,
+        max_steps: int | None = None,
         max_context_tokens: int = DEFAULT_CONTEXT_LIMIT,
         consume_steer: Callable[[], str | None] | None = None,
+        pause_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.model = model
         self.store = store
         self.max_steps = max_steps
         self.max_context_tokens = max_context_tokens
         self.consume_steer = consume_steer
+        self.pause_requested = pause_requested
         self.executor = StudioActionExecutor(
             file_tree=_file_tree,
             record_changed_paths=self._record_changed_paths,
@@ -192,10 +195,27 @@ class StudioAgent:
         user_message: str,
         **options: Any,
     ) -> StudioSession:
-        result = await self._handle(session, user_message, **options)
+        try:
+            result = await self._handle(session, user_message, **options)
+        except UserPauseRequested:
+            return self._pause(session, "用户暂停了执行。")
         if result.status == "running":
             return self._pause(result, "执行已停止，但任务尚未满足完成条件。")
         return result
+
+    async def _await_model(self, awaitable):
+        """Cancel model I/O on pause; synchronous tools finish and commit first."""
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while not task.done():
+                if self.pause_requested and self.pause_requested():
+                    raise UserPauseRequested
+                await asyncio.wait({task}, timeout=0.1)
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def _handle(
         self,
@@ -213,10 +233,6 @@ class StudioAgent:
             skill_instructions = studio_skills.selected(session.repo_root, session.enabled_skills)
         except (ValueError, OSError) as exc:
             return self._pause(session, f"技能加载失败：{exc}")
-        if not resume_after_permission:
-            session.resume_decision = None
-            session.remaining_actions.clear()
-            session.once_grants.clear()
         previous_failure = session.failure_reason
         user_message_recorded = False
         resume_words = {"继续", "继续吧", "继续执行", "重试", "resume", "continue"}
@@ -237,82 +253,10 @@ class StudioAgent:
             and bool(session.plan)
             and session.status != "completed"
         )
-        if (
-            not is_resume
-            and session.status == "completed"
-            and re.fullmatch(r"\s*\d+\s*", user_message)
-        ):
-            message = (
-                f"我收到了“{user_message.strip()}”，但当前没有待选择的编号选项。"
-                "请直接说明你希望继续做什么。"
-            )
-            if record_user_message:
-                session.messages.append(StudioMessage(role="user", content=user_message))
-                self.store.save(session, "user_message", {"content": user_message})
-            session.messages.append(StudioMessage(role="assistant", content=message))
-            session.activity = "waiting_user"
-            session.pause_reason = "短编号输入缺少可解析的选项上下文"
-            self.store.save(
-                session,
-                "input_clarification",
-                {"summary": message, "original_message": user_message},
-            )
-            self.store.save(session, "assistant_message", {"content": message})
-            return session
-        if bare_resume and session.status == "completed":
-            session.messages.append(StudioMessage(role="user", content=user_message))
-            message = (
-                "这个任务已经完成并通过验证，不需要重复执行。"
-                "如果你想继续改进，请直接说明新的目标，我会基于当前代码继续处理。"
-            )
-            session.messages.append(StudioMessage(role="assistant", content=message))
-            self.store.save(session, "user_message", {"content": user_message})
-            self.store.save(session, "assistant_message", {"content": message})
-            return session
-        if (
-            not is_resume
-            and ambiguous_side_effect_request(user_message)
-            and (session.task_contract is None or session.status == "completed")
-        ):
-            message = (
-                "这句话可能表示继续讨论，也可能授权修改或执行。"
-                "为了避免扩大操作范围，请明确说明要我：仅分析、修改文件，还是运行命令。"
-            )
-            if record_user_message:
-                session.messages.append(StudioMessage(role="user", content=user_message))
-                self.store.save(session, "user_message", {"content": user_message})
-            session.messages.append(StudioMessage(role="assistant", content=message))
-            session.status = "idle"
-            session.activity = "waiting_user"
-            session.pause_reason = "需要确认含糊的操作意图"
-            self.store.save(
-                session,
-                "intent_clarification",
-                {"summary": message, "original_message": user_message},
-            )
-            self.store.save(session, "assistant_message", {"content": message})
-            return session
-        if (
-            bare_resume
-            and session.task_contract is not None
-            and session.task_contract.intent in {"answer", "analysis"}
-            and session.messages
-            and session.messages[-1].role == "assistant"
-            and not self._validate_task_contract(session)
-        ):
-            session.messages.append(StudioMessage(role="user", content=user_message))
-            message = (
-                "上一项读取或解释任务已经完成，不需要重复执行。"
-                "如果要继续处理，请直接说明新的修改、检查或运行目标。"
-            )
-            session.messages.append(StudioMessage(role="assistant", content=message))
-            session.status = "completed"
-            session.activity = "completed"
-            session.pause_reason = None
-            self.store.save(session, "user_message", {"content": user_message})
-            self.store.save(session, "completed", {"summary": message, "reason": "answer_complete"})
-            self.store.save(session, "assistant_message", {"content": message})
-            return session
+        if not resume_after_permission and not is_resume:
+            session.resume_decision = None
+            session.remaining_actions.clear()
+            session.once_grants.clear()
         workspace = SafeWorkspace(
             Path(session.repo_root),
             approved_roots=[
@@ -324,6 +268,27 @@ class StudioAgent:
         files = _file_tree(Path(session.repo_root))
         project = detect_project(Path(session.repo_root))
         symbol_index = PythonSymbolIndex(Path(session.repo_root)).build()
+        if is_resume and session.task_contract:
+            active_request = previous_request or session.task_contract.objective
+            policy, semantic = await self._resolve_intent_policy(
+                session, active_request, skill_instructions,
+            )
+            session.task_contract = session.task_contract.model_copy(update={
+                "intent": policy.intent,
+                "objective": active_request,
+                "objectives": [active_request],
+                "conditions": [],
+                "requested_actions": [],
+                "prohibited_actions": [],
+                "requires_clarification": False,
+                "intent_source": "model_pending",
+                "allowed_actions": sorted(action.value for action in policy.allowed_actions),
+                "scope_actions": [],
+                "denied_actions": sorted(action.value for action in policy.denied_actions),
+            })
+            session.task_state = self._build_task_state(
+                session, session.task_contract, active_request,
+            )
         if not is_resume:
             session.pending_model_call = None
             if not runtime_steer:
@@ -355,50 +320,9 @@ class StudioAgent:
             session.task_contract = self._updated_task_contract(
                 session, user_message, policy, semantic
             )
-            if contradictory_verification_request(user_message):
-                session.task_contract.requires_clarification = True
-                session.task_contract.intent_rationale = "同时检测到验证要求与全局命令禁令"
-            if semantic is not None:
-                session.task_contract.intent_source = "model+deterministic"
-                session.task_contract.intent_rationale = semantic.rationale
-                session.task_contract.requires_clarification = (
-                    semantic.requires_clarification
-                    or bool(contradictory_verification_request(user_message))
-                )
             session.task_state = self._build_task_state(
                 session, session.task_contract, user_message
             )
-            if session.task_contract.requires_clarification and not completion.is_bulk_delete(
-                user_message
-            ):
-                message = (
-                    "运行测试需要执行命令，但你同时要求‘不要运行任何命令’。"
-                    "请明确选择：允许运行测试，或保持命令禁令并跳过验证。"
-                    if contradictory_verification_request(user_message)
-                    else (
-                        semantic.clarification_question
-                        if semantic and semantic.clarification_question
-                        else "我理解到这句话可能涉及修改或执行，但操作授权不够明确。"
-                        "请明确说明要我：仅分析、修改文件，还是运行命令。"
-                    )
-                )
-                if record_user_message and not user_message_recorded:
-                    session.messages.append(StudioMessage(role="user", content=user_message))
-                    self.store.save(session, "user_message", {"content": user_message})
-                session.messages.append(StudioMessage(role="assistant", content=message))
-                session.status = "idle"
-                session.activity = "waiting_user"
-                session.pause_reason = "模型语义分类要求确认操作意图"
-                self.store.save(
-                    session,
-                    "intent_clarification",
-                    {
-                        "summary": message,
-                        "contract": session.task_contract.model_dump(mode="json"),
-                    },
-                )
-                self.store.save(session, "assistant_message", {"content": message})
-                return session
         if record_user_message and not user_message_recorded:
             session.messages.append(StudioMessage(role="user", content=user_message))
         self._refresh_context_summary(session)
@@ -435,7 +359,7 @@ class StudioAgent:
                 session,
                 "task_contract",
                 {
-                    "summary": "已建立可验收任务契约。",
+                    "summary": "已保留用户原始请求；任务理解由执行模型负责。",
                     "contract": session.task_contract.model_dump(mode="json"),
                     "task_state": session.task_state.model_dump(mode="json")
                     if session.task_state
@@ -465,6 +389,8 @@ class StudioAgent:
                 "turn_budget": session.turn_budget,
             },
         )
+        if self.pause_requested and self.pause_requested():
+            return self._pause(session, "用户暂停了执行。")
         if (
             session.verification_mode is VerificationMode.STRICT
             and not session.baseline_completed
@@ -524,34 +450,12 @@ class StudioAgent:
                 StudioRequirement(key="absent", description=f"删除 {path}", expected=path)
                 for path in targets
             ]
-            if targets:
-                batch = StudioDecision(
-                    action=StudioAction.BATCH,
-                    rationale="删除当前工作区列出的全部文件（保留受保护的元数据）",
-                    actions=[
-                        StudioDecision(
-                            action=StudioAction.DELETE_PATH,
-                            path=path,
-                            rationale="执行已确认的删除清单",
-                        )
-                        for path in targets
-                    ],
-                )
-                if self._execute(session, workspace, batch):
-                    return session
-            return self._finish_bulk_delete(session, workspace)
         action_counts: dict[str, int] = {}
         if session.resume_decision is not None:
             resumed = session.resume_decision
             session.resume_decision = None
             if self._execute(session, workspace, resumed):
                 return session
-            if (
-                session.task_contract
-                and session.task_contract.requirements
-                and all(r.key == "absent" for r in session.task_contract.requirements)
-            ):
-                return self._finish_bulk_delete(session, workspace)
             action_counts[self._action_fingerprint(resumed, session.action_epoch)] = 1
             if session.observations and session.observations[-1].kind == "tool_error":
                 session.remaining_actions.clear()
@@ -560,6 +464,11 @@ class StudioAgent:
                 session.remaining_actions = []
                 if self._execute_batch(session, workspace, remaining, user_message):
                     return session
+        if session.remaining_actions and session.resume_decision is None:
+            remaining = session.remaining_actions
+            session.remaining_actions = []
+            if self._execute_batch(session, workspace, remaining, user_message):
+                return session
         if resume_after_permission:
             # The approved command was executed by the API before this model
             # loop resumes. Seed the duplicate guard from that durable result
@@ -585,130 +494,15 @@ class StudioAgent:
                 )
                 action_counts[approved_fingerprint] = 1
 
-        direct_launch = (
-            None
-            if resume_after_permission
-            else self._direct_launch_decision(session, user_message, files)
-        )
-        if direct_launch is not None:
-            session.step += 1
-            self.store.save(
-                session,
-                "decision",
-                {
-                    "action": direct_launch.action,
-                    "rationale": direct_launch.rationale,
-                    "command": direct_launch.command,
-                },
-            )
-            try:
-                terminal = self._execute(
-                    session,
-                    workspace,
-                    direct_launch,
-                    permission_checked=session.permission_mode == "important",
-                )
-            except UnsafeStudioCommand:
-                install_go = direct_launch.command[:4] == [
-                    "winget",
-                    "install",
-                    "--id",
-                    "GoLang.Go",
-                ]
-                install_target = direct_launch.path if install_go else None
-                details = command_permission_details(direct_launch.command, direct_launch.rationale)
-                request = StudioPermissionRequest(
-                    request_id=uuid4().hex,
-                    path=session.repo_root,
-                    reason=(
-                        f"运行 {install_target} 需要 Go。允许后，RAgent 将使用 "
-                        "Windows 包管理器安装官方 Go 工具链，然后自动启动程序。"
-                        if install_target
-                        else direct_launch.rationale
-                    ),
-                    access="execute",
-                    command=direct_launch.command,
-                    follow_up_command=(["go", "run", install_target] if install_target else []),
-                    capability=(
-                        "install:go"
-                        if install_target
-                        else command_capability(direct_launch.command, Path(session.repo_root))
-                    ),
-                    **details,
-                )
-                session.pending_permission = request
-                session.status = "waiting_permission"
-                session.activity = "waiting_permission"
-                self.store.save(session, "permission_requested", request.model_dump(mode="json"))
-                return session
-            # A direct-launch route may pause for permission or fail. Successful
-            # launches remain tool observations and return to the model loop.
-            if terminal:
-                return session
-            action_counts[self._action_fingerprint(direct_launch, session.action_epoch)] = 1
-
-        direct_verification = (
-            None
-            if resume_after_permission
-            else self._direct_verification_decision(session, user_message)
-        )
-        if direct_verification is not None:
-            session.step += 1
-            self.store.save(
-                session,
-                "decision",
-                {
-                    "action": direct_verification.action,
-                    "rationale": direct_verification.rationale,
-                    "command": direct_verification.command,
-                },
-            )
-            if self._execute(session, workspace, direct_verification):
-                return session
-            if direct_verification.rationale == "直接执行用户要求的 Python 语法检查":
-                outcome = session.observations[-1].payload if session.observations else {}
-                passed = outcome.get("exit_code") == 0
-                target = direct_verification.command[-1]
-                detail = str(outcome.get("stderr") or outcome.get("stdout") or "").strip()
-                message = (
-                    f"语法检查通过：{target} 没有发现 Python 语法错误。"
-                    if passed
-                    else f"语法检查未通过：{target}。{detail or 'Python 返回了非零退出码。'}"
-                )
-                session.messages.append(StudioMessage(role="assistant", content=message))
-                session.status = "idle"
-                session.activity = "idle"
-                session.failure_reason = None if passed else message
-                self.store.save(session, "assistant_message", {"content": message})
-                return session
-            if session.verification_passed:
-                finish = StudioDecision(
-                    action=StudioAction.FINISH,
-                    rationale="用户要求的工作区验证已通过",
-                    message="修改已经写入当前工作区。",
-                )
-                self._execute(session, workspace, finish)
-                return session
-
         self.restore_verification_from_evidence(session)
 
-        # A previous turn may have exhausted its model-step budget immediately
-        # after a successful verification. Continuing such a task should close
-        # it from durable local evidence, not spend another model call asking
-        # for a redundant finish action.
-        if (
-            is_resume
-            and not resume_after_permission
-            and session.turn_changed_files
-            and session.verification_passed
-            and not self._validate_task_contract(session)
-        ):
-            return self._finish_from_verified_evidence(session, workspace, "恢复已验证任务")
-
-        current_limit = session.turn_budget
-        progress_checkpoint = len(session.observations)
         context_transform_recorded = False
-        for turn_step in range(self.max_steps):
+        for turn_step in count():
+            await asyncio.sleep(0)
+            if self.pause_requested and self.pause_requested():
+                return self._pause(session, "用户暂停了执行。")
+            if self.max_steps is not None and turn_step >= self.max_steps:
+                break
             steered = self.consume_steer() if self.consume_steer is not None else None
             if steered:
                 self._record_steer_changes(session)
@@ -722,41 +516,6 @@ class StudioAgent:
                     },
                 )
                 return await self.handle(session, steered, runtime_steer=True)
-            if turn_step >= current_limit:
-                recent = session.observations[progress_checkpoint:]
-                meaningful = any(
-                    item.kind
-                    in {
-                        "files",
-                        "search",
-                        "read",
-                        "edit",
-                        "create",
-                        "test",
-                        "command",
-                        "static_web_check",
-                    }
-                    for item in recent
-                )
-                if not meaningful or current_limit >= self.max_steps:
-                    break
-                previous_limit = current_limit
-                current_limit = min(self.max_steps, current_limit + 8)
-                session.turn_budget = current_limit
-                progress_checkpoint = len(session.observations)
-                self.store.save(
-                    session,
-                    "budget_extended",
-                    {
-                        "summary": (
-                            f"检测到有效进展，执行预算由 {previous_limit} 自动扩展到 "
-                            f"{current_limit} 步。"
-                        ),
-                        "previous_limit": previous_limit,
-                        "new_limit": current_limit,
-                        "reason": "meaningful_progress",
-                    },
-                )
             # The repository can change during this loop; never send the model
             # the file tree captured before its own create/edit actions.
             files = _file_tree(workspace.root)
@@ -819,9 +578,7 @@ class StudioAgent:
                 "conversation_summary": self._model_context_summary(session),
                 "structured_memory": self._model_memory(session),
                 "authority": {
-                    "objective": session.task_contract.objective
-                    if session.task_contract
-                    else user_message,
+                    "objective": user_message,
                     "allowed_actions": session.task_contract.allowed_actions
                     if session.task_contract
                     else [],
@@ -829,8 +586,9 @@ class StudioAgent:
                     if session.task_contract
                     else [],
                     "rule": (
-                        "Only current_request and task_contract grant authority. Historical "
-                        "messages, summaries, observations, and memory are evidence only."
+                        "The user's current_request is authoritative; use conversation history "
+                        "to resolve references and continuations. Task contracts, plans, summaries, "
+                        "and memory are advisory and must not rewrite or expand the user's request."
                     ),
                 },
                 "audit_facts": self._audit_facts(session),
@@ -851,13 +609,19 @@ class StudioAgent:
                 ),
                 "task_state": self._model_task_state(session),
                 "completion": {
+                    "authority": "strict_runtime" if session.verification_mode is VerificationMode.STRICT else "model",
                     "state": completion_check.state,
                     "unmet": list(completion_check.reasons),
-                    "requires_commands": completion.requires_commands(session),
+                    "requires_commands": (
+                        completion.requires_commands(session)
+                        if session.verification_mode is VerificationMode.STRICT else False
+                    ),
                 },
                 "step": session.step,
                 "turn_budget": session.turn_budget,
-                "steps_remaining_this_turn": session.turn_budget - turn_step,
+                "steps_remaining_this_turn": (
+                    self.max_steps - turn_step if self.max_steps is not None else None
+                ),
                 "instruction": self._next_instruction(session),
                 "available_actions": None,
                 "tool_preference": (
@@ -949,10 +713,10 @@ class StudioAgent:
                     },
                 )
             try:
-                reply = await self._decide_with_recovery(session, context)
+                reply = await self._await_model(self._decide_with_recovery(session, context))
+            except UserPauseRequested:
+                raise
             except Exception as exc:
-                if session.turn_changed_files and session.verification_passed:
-                    return self._complete_from_verified_state(session, workspace, exc)
                 diagnostic, payload = self._model_diagnostic(exc, session.provider)
                 self.store.save(session, "model_diagnostic", payload)
                 if self._is_retryable_model_error(exc):
@@ -993,41 +757,13 @@ class StudioAgent:
                 },
             )
             decision = reply.decision
+            if self.pause_requested and self.pause_requested():
+                session.pending_model_call = None
+                return self._pause(session, "用户暂停了执行；尚未执行模型返回的动作。")
             decision = ToolRouter.route(
                 decision, "" if session.task_contract else user_message,
                 required_surface=TaskEvidence.required_surface(session),
             )
-            # Analysis completion is evidence-driven: a model may answer from
-            # the filename or conversation without actually reading the target.
-            # Convert that premature terminal response into the one missing
-            # deterministic read instead of asking the model to repeat itself.
-            contract = session.task_contract
-            if (
-                decision.action in {StudioAction.RESPOND, StudioAction.FINISH}
-                and contract is not None
-                and (
-                    contract.intent in {"answer", "analysis"}
-                    or self._requests_explicit_file_read(user_message)
-                    or self._allows_unchanged_completion(user_message)
-                )
-            ):
-                unmet = self._validate_task_contract(session)
-                target = next(
-                    (
-                        item.expected
-                        for item in contract.requirements
-                        if item.key == "target_file"
-                        and item.description in unmet
-                        and item.expected
-                    ),
-                    None,
-                )
-                if target:
-                    decision = StudioDecision(
-                        action=StudioAction.READ,
-                        rationale="分析前先读取任务指定文件，建立可核验事实证据",
-                        path=target,
-                    )
             steered = self.consume_steer() if self.consume_steer is not None else None
             if steered:
                 self._record_steer_changes(session)
@@ -1042,7 +778,6 @@ class StudioAgent:
                 )
                 return await self.handle(session, steered, runtime_steer=True)
             self._normalize_workspace_decision_path(workspace, decision)
-            self._normalize_file_action(workspace, decision)
             session.activity = "executing_tool"
             self._apply_memory_update(session, decision)
             fingerprint = self._action_fingerprint(decision, session.action_epoch)
@@ -1054,13 +789,13 @@ class StudioAgent:
             # Reading the same file in a later user turn is valid because the
             # task or file may have changed. action_counts only suppresses a
             # genuinely repeated read inside this model loop.
-            redundant_read = (
-                decision.action is StudioAction.READ and action_counts[fingerprint] >= 2
-            )
+            redundant_read = False
             repeat_guarded = decision.action not in {
                 StudioAction.RESPOND,
                 StudioAction.FINISH,
                 StudioAction.FAIL,
+                StudioAction.READ,
+                StudioAction.SEARCH,
             } and not ActionLedger.refreshable(decision.action)
             repeated = max(action_counts[fingerprint], persistent_count if is_resume else 1)
             if redundant_read or (repeat_guarded and repeated >= 2):
@@ -1078,16 +813,6 @@ class StudioAgent:
                         )
                         session.observations.append(reused)
                         self.store.save(session, "command_reused", reused.model_dump(mode="json"))
-                        if self.is_verification_command(decision.command):
-                            session.verification_passed = True
-                            if not self._validate_task_contract(session):
-                                finish = StudioDecision(
-                                    action=StudioAction.FINISH,
-                                    rationale="复用已经通过的验证证据完成任务",
-                                    message="修改已经写入当前工作区。",
-                                )
-                                self._execute(session, workspace, finish)
-                                return session
                         continue
                 cross_turn = persistent_count >= 2 and action_counts[fingerprint] == 1
                 correction = StudioObservation(
@@ -1117,23 +842,6 @@ class StudioAgent:
                 session.observations.append(correction)
                 self._remember_unique(session.memory.failures, correction.summary, 40)
                 self.store.save(session, "duplicate_corrected", correction.model_dump(mode="json"))
-                # Some compatible models keep asking to re-read after the requested
-                # edit and verification are already complete. At that point the
-                # repetition is harmless but pausing is the wrong outcome: the
-                # controller has enough local evidence to close the task itself.
-                if (
-                    repeated >= 3
-                    and session.turn_changed_files
-                    and session.verification_passed
-                    and not self._validate_task_contract(session)
-                ):
-                    finish = StudioDecision(
-                        action=StudioAction.FINISH,
-                        rationale="修改与验证证据已经齐全，拦截重复检查后自动完成任务。",
-                        message="请求的修改已经完成，并已通过本地验证。",
-                    )
-                    self._execute(session, workspace, finish)
-                    return session
                 # The second identical action is intercepted and fed back to
                 # the model as a correction. Only pause if the model ignores
                 # that correction and proposes the same action once more.
@@ -1177,39 +885,10 @@ class StudioAgent:
                     else False
                 ),
             )
-            if next_step is TurnNext.COMPLETE_VERIFIED:
-                return self._finish_from_verified_evidence(
-                    session, workspace, "验证通过后验收证据齐全"
-                )
             if next_step is TurnNext.FOLLOW_UP_MUTATION:
                 symbol_index.refresh(session.turn_changed_files)
                 if self._follow_up_after_mutation(session, workspace, user_message):
                     return session
-        if session.turn_changed_files and session.verification_passed:
-            return self._finish_from_verified_evidence(session, workspace, "预算结束时证据齐全")
-        if session.turn_changed_files and not session.verification_passed:
-            automatic = self._automatic_verification_decision(session)
-            if automatic is not None:
-                automatic_passed = False
-                try:
-                    if self._execute(session, workspace, automatic):
-                        return session
-                except (OSError, UnsafeStudioCommand):
-                    automatic_passed = False
-                else:
-                    automatic_passed = bool(
-                        session.observations
-                        and session.observations[-1].payload.get("exit_code") == 0
-                    )
-                if automatic_passed:
-                    session.verification_passed = True
-                    return self._finish_from_verified_evidence(
-                        session, workspace, "预算结束时自动验证通过"
-                    )
-            elif self._verify_static_web_artifacts(session, workspace):
-                return self._finish_from_verified_evidence(
-                    session, workspace, "预算结束时网页静态验证通过"
-                )
         return self._pause(
             session,
             "本轮执行已安全暂停，计划、上下文和已有改动都已保存。"
@@ -1270,23 +949,6 @@ class StudioAgent:
                 setattr(decision, field, ".")
             elif candidate.is_relative_to(workspace.root):
                 setattr(decision, field, candidate.relative_to(workspace.root).as_posix())
-
-    @staticmethod
-    def _normalize_file_action(workspace: SafeWorkspace, decision: StudioDecision) -> None:
-        """Represent writing an existing file as an edit before approval and execution."""
-        if decision.action is StudioAction.BATCH:
-            for action in decision.actions:
-                StudioAgent._normalize_file_action(workspace, action)
-            return
-        if decision.action is not StudioAction.CREATE or not decision.path:
-            return
-        target = workspace.resolve(decision.path)
-        if not target.is_file():
-            return
-        decision.action = StudioAction.EDIT
-        decision.old_text = target.read_text(encoding="utf-8")
-        decision.new_text = decision.content
-        decision.content = None
 
     async def _decide_with_recovery(
         self, session: StudioSession, context: dict[str, object]
@@ -1499,6 +1161,12 @@ class StudioAgent:
             + "\n".join(f"{a.action.value}: {a.path or a.command}" for a in actions),
             actions=actions,
         )
+        # The delete fast path bypasses _execute_action for individual items.
+        # Check explicit task prohibitions before asking for or using a grant.
+        if all(a.action is StudioAction.DELETE_PATH for a in actions):
+            for item in actions:
+                if self._enforce_capability(session, workspace, item):
+                    return True
         if all(a.action is StudioAction.DELETE_PATH for a in actions) and requires_approval(
             session, batch
         ):
@@ -1529,6 +1197,15 @@ class StudioAgent:
             session.once_grants.remove(grant)
         changed = False
         for index, action in enumerate(actions, start=1):
+            if self.pause_requested and self.pause_requested():
+                session.remaining_actions = actions[index - 1:]
+                if approved:
+                    for remaining in session.remaining_actions:
+                        key = approval_fingerprint(remaining)
+                        if key not in session.once_grants:
+                            session.once_grants.append(key)
+                self._pause(session, "用户暂停了执行；已保存剩余批量动作。")
+                return True
             if approved:
                 session.once_grants.append(approval_fingerprint(action))
             self._apply_memory_update(session, action)
@@ -1552,6 +1229,16 @@ class StudioAgent:
                 self.store.save(
                     session, "batch_checkpoint", {"remaining": len(session.remaining_actions)}
                 )
+            elif terminal and session.status == "paused":
+                session.remaining_actions = actions[index:]
+                if approved:
+                    for remaining in session.remaining_actions:
+                        key = approval_fingerprint(remaining)
+                        if key not in session.once_grants:
+                            session.once_grants.append(key)
+                self.store.save(
+                    session, "batch_checkpoint", {"remaining": len(session.remaining_actions)}
+                )
             if session.observations and session.observations[-1].kind in {
                 "tool_error",
                 "capability_guard",
@@ -1572,13 +1259,6 @@ class StudioAgent:
             session, workspace, user_message, finish_when_ready=False
         ):
             return True
-        if changed and session.verification_passed:
-            finish = StudioDecision(
-                action=StudioAction.FINISH,
-                rationale="批量修改及验证已完成",
-                message="批量修改与本地检查通过。",
-            )
-            return self._execute(session, workspace, finish)
         return False
 
     def _follow_up_after_mutation(
@@ -1589,36 +1269,7 @@ class StudioAgent:
         *,
         finish_when_ready: bool = True,
     ) -> bool:
-        """One post-write policy for single and batched file operations.
-
-        The runtime only forces a check when the user explicitly requested it,
-        or when a static web artifact can be checked without running a command.
-        All other outcomes return to the model's tool/answer loop.
-        """
-        if session.verification_passed:
-            return False
-        direct = self._direct_verification_decision(session, user_message)
-        if direct is not None:
-            session.step += 1
-            self.store.save(session, "decision", {
-                "action": direct.action, "rationale": direct.rationale,
-                "command": direct.command,
-            })
-            if self._execute(session, workspace, direct):
-                return True
-            if finish_when_ready and session.verification_passed:
-                return self._execute(session, workspace, StudioDecision(
-                    action=StudioAction.FINISH,
-                    rationale="用户指定的验证在修改后通过",
-                    message="修改已经写入当前工作区。",
-                ))
-            return False
-        if self._verify_static_web_artifacts(session, workspace) and finish_when_ready:
-            return self._execute(session, workspace, StudioDecision(
-                action=StudioAction.FINISH,
-                rationale="静态 Web 项目本地校验通过",
-                message="网页结构与脚本检查通过。",
-            ))
+        """Return post-write control to the model; evidence is already committed."""
         return False
 
     def _finish_bulk_delete(
@@ -2115,22 +1766,22 @@ class StudioAgent:
             )
         if launch_requested and mutation_requested:
             requirements.append(
-                StudioRequirement(key="launch_after_change", description="验证后打开新产物")
+                StudioRequirement(key="launch_after_change", description="打开新产物")
             )
         requirements.extend(TaskEvidence.requested_tools(task_text))
         return StudioTaskContract(
-            objective="；".join(semantic.objectives)
-            if semantic and semantic.objectives
-            else user_message.strip(),
+            objective=user_message.strip(),
             intent=policy.intent,
             intent_confidence=policy.confidence,
             intent_rationale=policy.rationale,
             allowed_actions=sorted(action.value for action in policy.allowed_actions),
+            scope_actions=[],
+            intent_source="model" if semantic is not None else "model_pending",
             denied_actions=sorted(action.value for action in policy.denied_actions),
             evidence_required=policy.evidence_required,
             requirements=requirements,
             dialogue_act=semantic.dialogue_act if semantic else "instruction",
-            objectives=semantic.objectives if semantic else [user_message.strip()],
+            objectives=[user_message.strip()],
             questions=semantic.questions if semantic else [],
             requested_actions=semantic.requested_actions if semantic else [],
             prohibited_actions=semantic.prohibited_actions if semantic else [],
@@ -2158,9 +1809,13 @@ class StudioAgent:
                 r"(?i)(?:如果|要是).{0,30}(?:失败|不通过|有问题).{0,12}(?:才|再)", user_message
             )
         )
-        if conditional:
+        if conditional and semantic is None and policy.intent != "unresolved":
             policy = classify_intent("运行测试")
         current = cls._build_task_contract(session, user_message, policy=policy, semantic=semantic)
+        if policy.intent == "unresolved":
+            # Let the execution model interpret follow-ups from the original dialogue.
+            # A local merge must not turn prior interpretations into new instructions.
+            return current
         if not (correction or addition or conditional):
             return current
         if previous is not None and addition and not correction:
@@ -2175,11 +1830,12 @@ class StudioAgent:
                     if (item.key, item.expected, item.description) not in known
                 ],
             ][:20]
-        if conditional:
+        if conditional and semantic is None and policy.intent != "unresolved":
             current.intent = "verify"
             current.intent_rationale = "先验证；仅在条件成立后才能建立新的修改授权"
             current.requires_clarification = False
-        current.intent_source = "followup_update"
+        if semantic is None and policy.intent != "unresolved":
+            current.intent_source = "followup_update"
         return current
 
     @staticmethod
@@ -2199,7 +1855,7 @@ class StudioAgent:
         denied = set(contract.denied_actions)
         explicitly_requests_verification = (
             StudioAction.RUN_TESTS.value in contract.requested_actions
-            if contract.intent_source == "model+deterministic"
+            if contract.intent_source in {"model", "model_pending", "model+deterministic"}
             else classify_intent(user_message).verification_requested
         )
         if command_actions & denied:
@@ -2359,66 +2015,10 @@ class StudioAgent:
         user_message: str,
         skill_instructions: list[dict[str, str]],
     ) -> tuple[IntentPolicy, SemanticIntentAssessment | None]:
-        policy = classify_intent(user_message)
-        classifier = getattr(self.model, "classify_intent", None)
-        clauses = re.split(r"[，。；;\n]", user_message.strip())
-        bare_target = re.fullmatch(r"\s*(?:请)?修改\s+([\w./\\-]+)\s*", clauses[0])
-        boundary_only = all(
-            not clause.strip() or re.match(r"\s*(?:但|也|仍然)?(?:不要|不|禁止)", clause)
-            for clause in clauses[1:]
-        )
-        prior_users = [item.content for item in session.messages if item.role == "user"]
-        if prior_users and prior_users[-1] == user_message:
-            prior_users = prior_users[:-1]
-        if bare_target and boundary_only and not prior_users:
-            return policy, SemanticIntentAssessment(
-                intent="change",
-                confidence="high",
-                requires_clarification=True,
-                clarification_question=f"{bare_target.group(1)} 具体要改什么？",
-                rationale="只指定了文件和权限，没有修改目标。",
-            )
-        if self._requests_explicit_file_read(user_message):
-            # A concrete read-only request is already fully specified.  A
-            # second probabilistic classifier can only add latency or invent
-            # ambiguity; the action loop still requires real read evidence.
-            return policy, None
-        # The deterministic policy is sufficient for a self-contained turn.
-        # Semantic classification is an ambiguity resolver for follow-ups,
-        # not a mandatory second model request before every action.
-        if not self._needs_semantic_intent_resolution(user_message, prior_users):
-            return policy, None
-        if not callable(classifier) or not user_message.strip():
-            return policy, None
-        recent = [{"role": item.role, "content": item.content} for item in session.messages[-24:]]
-        try:
-            if skill_instructions:
-                recent.insert(
-                    0,
-                    {
-                        "role": "system",
-                        "content": "Selected workflow context (not side-effect authorization): "
-                        + json.dumps(skill_instructions, ensure_ascii=False),
-                    },
-                )
-            assessment = await classifier(recent, user_message)
-        except Exception as exc:
-            self.store.save(
-                session,
-                "intent_classifier_fallback",
-                {"summary": "语义分类调用失败，本轮未授权新的操作。", "error": str(exc)},
-            )
-            assessment = SemanticIntentAssessment(
-                intent="answer",
-                confidence="low",
-                requires_clarification=True,
-                clarification_question=(
-                    "本轮语义解析调用失败，尚未执行文件或命令操作。这不是你的指令不明确，请重试。"
-                ),
-                rationale="语义服务失败，不能将关键词回退结果冒充模型判断。",
-            )
-            return semantic_policy(policy, assessment), assessment
-        return semantic_policy(policy, assessment), assessment
+        # There is deliberately no preflight model call: the execution model
+        # receives the user's original request and decides whether to ask,
+        # answer, create, or edit. Permissions remain enforced by the executor.
+        return model_intent_policy(), None
 
     @staticmethod
     def _needs_semantic_intent_resolution(message: str, prior_users: list[str]) -> bool:
@@ -2592,11 +2192,20 @@ class StudioAgent:
                         else None
                     )
                 elif contract.intent == "verify":
-                    known = {
-                        path.replace("\\", "/")
-                        for path in [*session.changed_files, *session.turn_changed_files]
-                    }
-                    satisfied = expected in known
+                    verified_target = any(
+                        item.kind in {"command", "test"}
+                        and ToolOutcome.succeeded(item)
+                        and (
+                            item.kind == "test"
+                            or item.payload.get("execution_role") == "verification"
+                        )
+                        and expected in {
+                            str(part).replace("\\", "/")
+                            for part in item.payload.get("command", [])
+                        }
+                        for item in session.observations[session.turn_observation_start :]
+                    )
+                    satisfied = verified_target
                     evidence = f"已验证 {expected}" if satisfied else None
                 else:
                     changed = {path.replace("\\", "/") for path in session.turn_changed_files}
@@ -2626,17 +2235,12 @@ class StudioAgent:
                 satisfied = session.verification_passed
                 evidence = "本轮验证通过，未发现无关行为回归" if satisfied else None
             elif requirement.key == "launch_after_change":
-                last_change = max(
-                    (
-                        index
-                        for index, item in enumerate(session.observations)
-                        if item.kind in completion.MUTATIONS
-                    ),
-                    default=-1,
-                )
+                if requirement.description == "验证后打开新产物":
+                    requirement.description = "打开新产物"
+                # Launch evidence belongs to the task, not the latest mutation.
+                # Whether changed code needs reloading is a contextual decision.
                 satisfied = any(
-                    index > last_change
-                    and (
+                    (
                         (
                             item.kind == "command"
                             and item.payload.get("exit_code") == 0
@@ -2665,7 +2269,7 @@ class StudioAgent:
                             and item.payload.get("launch_target") in session.turn_changed_files
                         )
                     )
-                    for index, item in enumerate(session.observations)
+                    for item in session.observations[session.turn_observation_start :]
                 )
                 evidence = "新产物已启动" if satisfied else None
             requirement.satisfied = satisfied
@@ -2868,6 +2472,10 @@ class StudioAgent:
         permission_checked: bool = False,
     ) -> bool:
         """All routes share error handling, permission checks and committed effects."""
+        if self.pause_requested and self.pause_requested():
+            session.resume_decision = decision
+            self._pause(session, "用户暂停了执行；已保存尚未执行的动作。")
+            return True
         try:
             return self._execute_action(
                 session, workspace, decision, permission_checked=permission_checked
@@ -2901,14 +2509,10 @@ class StudioAgent:
     def _reuse_launch(
         self, session: StudioSession, workspace: SafeWorkspace, target: str | None
     ) -> bool:
-        """Observe an existing launch for this file revision before allowing another."""
+        """Observe an existing launch in this task before allowing another."""
         if not target:
             return False
-        last_change = max(
-            (i for i, item in enumerate(session.observations) if item.kind in completion.MUTATIONS),
-            default=session.turn_observation_start - 1,
-        )
-        for prior in reversed(session.observations[last_change + 1 :]):
+        for prior in reversed(session.observations[session.turn_observation_start :]):
             payload = prior.payload
             raw_command = payload.get("command")
             prior_command = raw_command if isinstance(raw_command, list) else []
@@ -2978,18 +2582,22 @@ class StudioAgent:
     ) -> bool:
         """Apply task-state capability rules before any execution surface runs."""
         action = decision.action
+        contract = session.task_contract
+        denied = set(contract.denied_actions if contract else [])
         if session.task_state is not None:
-            denial = (
-                f"当前统一任务状态未授权 {action.value}。"
-                if action.value not in session.task_state.allowed_actions
-                else None
-            )
+            denied.update(session.task_state.denied_actions)
+        explicitly_denied = action.value in denied
+        if explicitly_denied:
+            denial = f"用户明确禁止 {action.value}。"
+        elif contract is not None and contract.intent in {"answer", "analysis"} and action in {
+            StudioAction.EDIT, StudioAction.APPLY_PATCH, StudioAction.CREATE,
+            StudioAction.MOVE_FILE, StudioAction.COPY_FILE, StudioAction.DELETE_PATH,
+            StudioAction.GIT_COMMIT, StudioAction.GIT_RESTORE,
+            StudioAction.START_TERMINAL, StudioAction.WRITE_TERMINAL, StudioAction.STOP_TERMINAL,
+        }:
+            denial = "模型将当前任务理解为问答或分析；产生副作用需要用户确认。"
         else:
-            denial = (
-                denied_action_reason(session.task_contract, action)
-                if session.task_contract is not None
-                else None
-            )
+            denial = None
         if denial is None:
             return False
         approval_actions = {
@@ -2999,10 +2607,9 @@ class StudioAgent:
             StudioAction.WRITE_TERMINAL, StudioAction.STOP_TERMINAL,
             StudioAction.GIT_COMMIT, StudioAction.GIT_RESTORE,
         }
-        if action in approval_actions:
+        if not explicitly_denied and action in approval_actions:
             self._request_action_approval(session, decision)
             return True
-        contract = session.task_contract
         observation = StudioObservation(
             kind="capability_guard",
             summary=f"已阻止 {action.value}：{denial}",
@@ -3020,7 +2627,8 @@ class StudioAgent:
                 ),
             },
         )
-        return self._commit_observation(session, workspace, action, observation)
+        self._commit_observation(session, workspace, action, observation)
+        return True
 
     def _execute_action(
         self,
@@ -3196,7 +2804,11 @@ class StudioAgent:
             reviewed_message = self._unwrap_decision_message(decision.message)
             if decision.claims:
                 reviewed_message, claim_audit = self._render_claims(session, decision)
-                self.store.save(session, "claim_review", {"claims": claim_audit})
+                self.store.save(session, "claim_review", {
+                    "summary": "回答证据审核已记录；保留模型原文。",
+                    "claims": claim_audit,
+                    "model_message": reviewed_message,
+                })
             if action is StudioAction.FINISH:
                 result_review = self._review_final_result(session, reviewed_message)
                 review_observation = StudioObservation(
@@ -3204,7 +2816,7 @@ class StudioAgent:
                     summary=(
                         "独立结果审查通过。"
                         if result_review.verdict is FinalReviewVerdict.PASSED
-                        else "独立结果审查已纠正最终回答。"
+                        else "独立结果审查发现差异；审核意见已记录。"
                         if result_review.verdict is FinalReviewVerdict.CORRECTED
                         else "独立结果审查阻止完成：" + "；".join(result_review.blockers) + "。"
                     ),
@@ -3218,7 +2830,8 @@ class StudioAgent:
                 if not session.turn_changed_files:
                     session.review_completed = True
                     session.review_summary = review_observation.summary
-                reviewed_message = result_review.reviewed_message
+                if session.verification_mode is VerificationMode.STRICT:
+                    reviewed_message = result_review.reviewed_message
             if action is StudioAction.FINISH and session.turn_changed_files:
                 review = self._review_changes(session, workspace)
                 observation = StudioObservation(
@@ -3966,33 +3579,9 @@ class StudioAgent:
             ),
         }
 
-    def _dynamic_budget(self, message: str, file_count: int) -> int:
-        requirements = len(re.findall(r"(?m)^\s*(?:\d+[.)]|[-*])\s+", message))
-        action_terms = (
-            "修复",
-            "修改",
-            "创建",
-            "新建",
-            "制作",
-            "开发",
-            "实现",
-            "重写",
-            "重构",
-            "升级",
-            "添加",
-            "删除",
-            "迁移",
-        )
-        risk_terms = ("重构", "跨文件", "并发", "恢复", "迁移", "安全", "完整测试")
-        score = sum(term in message for term in risk_terms)
-        if not any(term in message for term in action_terms):
-            return min(self.max_steps, 8)
-        proposed = 28 + min(requirements, 6) * 2 + min(score, 5) * 3
-        if len(message) > 500:
-            proposed += 6
-        if file_count > 120:
-            proposed += 8
-        return min(self.max_steps, max(min(self.max_steps, 16), proposed))
+    def _dynamic_budget(self, message: str, file_count: int) -> int | None:
+        # Resource limits are configured, not inferred from task vocabulary.
+        return self.max_steps
 
     @staticmethod
     def _build_plan(
@@ -4013,7 +3602,7 @@ class StudioAgent:
             if item.key not in {"verification", "launch_after_change"}
         ]
         launch_required = any(item.key == "launch_after_change" for item in requirements)
-        # A compiled contract is authoritative; text is only a legacy fallback.
+        # These are display/planning hints, not authority over the user request.
         policy = classify_intent(request) if contract is None else None
         intent = contract.intent if contract else policy.intent
         launch_requested = launch_required or intent == "launch_only"
@@ -4336,12 +3925,7 @@ class StudioAgent:
     @staticmethod
     def _reusable_read_evidence(session: StudioSession) -> dict[str, Any] | None:
         """Expose successful current-turn reads without waiting for a duplicate call."""
-        if (
-            not session.task_contract
-            or session.task_contract.intent not in {"answer", "analysis"}
-            or not session.observations
-            or StudioAgent._validate_task_contract(session)
-        ):
+        if not session.observations:
             return None
         for index in range(len(session.observations) - 1, session.turn_observation_start - 1, -1):
             item = session.observations[index]
@@ -4362,7 +3946,7 @@ class StudioAgent:
 
     @staticmethod
     def _next_instruction(session: StudioSession) -> str:
-        if session.observations and session.observations[-1].kind in {
+        if session.verification_mode is VerificationMode.STRICT and session.observations and session.observations[-1].kind in {
             "requirement_gate", "verification_gate"
         }:
             unmet = session.observations[-1].payload.get("unmet", [])
@@ -4422,7 +4006,11 @@ class StudioAgent:
                 "上一步只读工具已成功，结果在 answer_evidence 和 latest_tool_result。"
                 "先判断它是否足以回答当前请求：足够就直接回答；不足才选择不同的下一步工具。"
             )
-        return "按照当前计划选择一个最有信息增益的审计操作；避免重复读取和无关搜索。"
+        return (
+            "根据用户请求和真实工具结果决定下一步或结束任务。"
+            "默认模式下计划与任务契约是参考，不是必须补齐的流程；"
+            "自行判断是否需要测试或启动，如实说明已完成和未完成事项。"
+        )
 
     def _set_plan(
         self, session: StudioSession, key: str, status: PlanStatus, note: str | None = None
@@ -4662,96 +4250,21 @@ class StudioAgent:
         return audit
 
     @staticmethod
-    def _answer_from_claims(session: StudioSession, audit: list[dict]) -> str:
-        """Safe fallback when the proposed answer lacks supported audit references."""
-        lines = []
-        file_lists: list[tuple[int, list[str]]] = []
-        covered_files = {
-            file
-            for claim in audit
-            if claim["effective_kind"] == "observation"
-            for source_kind, payload in [StudioAgent._claim_source(session, claim["observation_id"])]
-            if source_kind == "files"
-            for file in payload["files"]
-        }
-        for claim in audit:
-            kind = claim["effective_kind"]
-            observation_id = claim["observation_id"]
-            source_kind, payload = StudioAgent._claim_source(session, observation_id)
-            if kind == "observation":
-                if source_kind == "files":
-                    file_lists.append((observation_id, payload["files"]))
-                else:
-                    content = payload["content"]
-                    path = str(payload.get("path", "文件"))
-                    lines.append(
-                        f"{path} 读取结果：\n{content}" if content else f"{path} 内容为空。"
-                    )
-            elif kind == "fact":
-                if source_kind == "files":
-                    if claim["text"] not in covered_files:
-                        lines.append(f"文件列表中包含：{claim['text']}")
-                else:
-                    path = str(payload.get("path", "文件"))
-                    lines.append(f"{path} 读取记录中的原文：{claim['text']}")
-            elif kind == "inference":
-                lines.append(f"推测：{claim['text']}")
-            # Unknown and unsupported claims remain in claim_review for audit.
-            # They are not facts to append to a user-facing answer.
-        if file_lists:
-            current = [
-                item for item in file_lists if item[0] >= session.turn_observation_start
-            ]
-            _, files = max(current or file_lists, key=lambda item: item[0])
-            lines.insert(0, "文件列表：\n" + "\n".join(files) if files else "文件列表为空。")
-        return "\n\n".join(dict.fromkeys(lines)) or "目前没有足够证据回答这个问题。"
-
-    @staticmethod
     def _render_claims(session: StudioSession, decision: StudioDecision) -> tuple[str, list[dict]]:
         """Keep model-authored final text separate from the evidence audit."""
         audit = StudioAgent._audit_claims(session, decision)
         message = StudioAgent._unwrap_decision_message(decision.message or "").strip()
-        # The task contract, not the optional claims array, determines whether
-        # the final answer needs workspace evidence. Keep the audit for diagnosis,
-        # but do not turn claims about host-supplied context or general knowledge
-        # into a replacement answer for evidence-free requests.
-        if (
-            session.task_contract is not None
-            and not session.task_contract.evidence_required
-        ):
-            return message, audit
-        grounded = bool(message) and all(
-            claim["effective_kind"] in {"fact", "observation"}
-            and claim["source_matched"] is True
-            for claim in audit
-        )
-        # A valid citation alone does not ground unrelated prose. Require the
-        # proposed answer to visibly refer to its cited evidence; otherwise
-        # present a conservative projection of the tool result instead.
-        referenced = False
-        for claim in audit:
-            source_kind, payload = StudioAgent._claim_source(session, claim["observation_id"])
-            if claim["effective_kind"] == "fact" and claim["text"] in message:
-                referenced = True
-            elif claim["effective_kind"] == "observation" and source_kind == "files":
-                files = payload["files"]
-                referenced |= any(path in message for path in files) or (
-                    not files and "空" in message
-                )
-            elif claim["effective_kind"] == "observation" and source_kind == "read":
-                path = str(payload.get("path", ""))
-                referenced |= bool(path and path in message) or (
-                    not payload.get("content") and "空" in message
-                )
-        return (
-            message if grounded and referenced else StudioAgent._answer_from_claims(session, audit),
-            audit,
-        )
+        # Unsupported references are diagnostic data, not authority to replace
+        # the model's answer with a local projection or canned refusal.
+        return message, audit
 
     @staticmethod
     def _review_final_result(session: StudioSession, proposed_message: str) -> StudioFinalReview:
         """Audit final claims against controller-owned state, never model confidence."""
-        unmet = StudioAgent._validate_task_contract(session)
+        unmet = (
+            StudioAgent._validate_task_contract(session)
+            if session.verification_mode is VerificationMode.STRICT else []
+        )
         changed = list(dict.fromkeys(session.turn_changed_files))
         normalized = proposed_message.casefold()
         verification_claim_pattern = (

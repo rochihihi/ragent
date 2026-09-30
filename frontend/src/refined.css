@@ -159,7 +159,7 @@ body{color:var(--ink);background:#101114}
 .activity-entry:first-child{border-color:rgba(219,226,237,.3);background:linear-gradient(135deg,rgba(216,225,238,.13),rgba(255,255,255,.045));box-shadow:inset 0 1px 0 rgba(255,255,255,.13),0 12px 28px rgba(0,0,0,.14)}
 .activity-entry summary{display:block;min-width:0;padding:12px 13px;cursor:pointer;list-style:none}.activity-entry summary::-webkit-details-marker{display:none}.activity-entry summary::marker{content:""}.activity-entry summary:focus-visible{outline:2px solid #b9c8df;outline-offset:-3px;border-radius:12px}
 .activity-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}.activity-head strong{min-width:0;color:#edf1f6;font-size:11px;font-weight:700;line-height:1.35}.activity-head time{flex:none;color:#828d9d;font:10px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums}
-.activity-entry summary>small{display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:3;margin-top:7px;color:#aab4c2;font-size:11px;line-height:1.5;overflow-wrap:anywhere}.activity-entry[open] summary>small{-webkit-line-clamp:unset}.activity-entry:first-child .activity-head strong{color:#fff}
+.activity-entry summary>small{display:block;white-space:pre-wrap;margin-top:7px;color:#aab4c2;font-size:11px;line-height:1.5;overflow-wrap:anywhere}.activity-entry:first-child .activity-head strong{color:#fff}
 .activity-entry.event-completed .activity-head strong{color:#c7e1d0}.activity-entry.event-failed .activity-head strong,.activity-entry.event-paused .activity-head strong{color:#f1b5b9}.activity-entry.event-context_compressed .activity-head strong,.activity-entry.event-context_trimmed .activity-head strong{color:#c1d3ef}
 .activity-entry pre{max-height:260px;overflow:auto;margin:0;padding:12px 13px;border-top:1px solid rgba(255,255,255,.1);color:#cbd5e2;background:rgba(10,12,16,.42);font:10px/1.55 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 @media(prefers-reduced-motion:reduce){.activity-entry{transition:none}.activity-entry:hover{transform:none}}
@@ -220,4 +220,25 @@ body{color:var(--ink);background:#0b0c0e}
 .trace-detail-toggle{margin-top:4px;padding:0;border:0;background:transparent;color:#aeb7c5;font-size:11px;cursor:pointer;text-align:left}
 .trace-detail-toggle:hover{color:#fff;text-decoration:underline}
 .completion-result>header,.completion-grid>section,.diagnostic-result>header,.diagnostic-result section{border:0;background:transparent}
+
+/* Working status: monochrome glass dashboard, scoped to the existing panel. */
+.agent-working{width:min(760px,100%);padding:0;overflow:hidden;border:1px solid rgba(255,255,255,.22);border-radius:12px;color:#f3f3f3;background:rgba(255,255,255,.055);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 12px 32px rgba(0,0,0,.1);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px)}
+.working-header{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.12)}
+.working-header>div{min-width:0;flex:1}.working-header strong{font-size:14px;line-height:1.4}.working-header small{margin-top:2px;color:#bdbdbd;font-size:11px}.working-header>b{color:#d8d8d8;font:500 11px/1.3 "Microsoft YaHei UI","Microsoft YaHei",sans-serif;white-space:nowrap}
+.working-dashboard{display:grid;grid-template-columns:minmax(180px,36%) minmax(0,1fr);min-height:210px}
+.working-gauge{position:relative;display:grid;place-items:center;min-height:210px;border-right:1px solid rgba(255,255,255,.11)}
+.working-gauge-ring{position:absolute;width:140px;height:140px;border:8px solid rgba(255,255,255,.15);border-top-color:rgba(255,255,255,.9);border-radius:50%;animation:working-orbit 2.5s linear infinite}
+.working-gauge-label{position:relative;display:flex;flex-direction:column;align-items:center;gap:5px;text-align:center}.working-gauge-label strong{max-width:110px;color:#f5f5f5;font-size:17px;line-height:1.35}.working-gauge-label small{margin:0;color:#bcbcbc;font:500 12px/1.4 "Cascadia Code",Consolas,monospace}
+.working-overview{display:flex;flex-direction:column;gap:14px;padding:23px 20px}
+.working-current{display:flex;align-items:flex-start;gap:12px;min-height:88px;padding:18px;border:1px solid rgba(255,255,255,.18);border-radius:9px;background:rgba(255,255,255,.075)}
+.working-live-dot{flex:none;width:9px;height:9px;margin-top:5px;border-radius:50%;background:#f5f5f5;box-shadow:0 0 0 5px rgba(255,255,255,.11);animation:working-breathe 1.8s ease-in-out infinite}
+.working-current>div{min-width:0}.working-current strong{overflow-wrap:anywhere;font-size:13px;line-height:1.5}.working-current small{margin-top:6px;color:#bebebe;font-size:11px;line-height:1.5}
+.working-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.working-stats>div{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:66px;padding:13px 15px;border:1px solid rgba(255,255,255,.13);border-radius:8px;background:rgba(255,255,255,.035)}
+.working-stats span{color:#bdbdbd;font-size:11px}.working-stats strong{color:#f1f1f1;font:600 21px/1 "Cascadia Code",Consolas,monospace}
+.agent-working .working-slow-note{margin:0;padding:0 18px 12px;color:#c9c9c9;font-size:11px}
+.working-details{border-top:1px solid rgba(255,255,255,.12)}.working-details summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 18px;color:#d8d8d8;font-size:11px;cursor:pointer;list-style:none}.working-details summary::-webkit-details-marker{display:none}.working-details summary::after{content:"⌄";margin-left:auto;color:#aaa;font-size:15px;line-height:1}.working-details[open] summary::after{content:"⌃"}.working-details summary span{color:#aaa;font:500 11px/1 "Cascadia Code",Consolas,monospace}.working-details summary:hover{background:rgba(255,255,255,.05)}
+.working-details .working-plan{margin:0;padding:0 18px 9px}.working-details .working-plan li{padding:8px 0}.working-details .working-plan li b{font-size:11px}.working-details .working-plan li small{font-size:10px}
+@keyframes working-orbit{to{transform:rotate(360deg)}}@keyframes working-breathe{50%{opacity:.45;box-shadow:0 0 0 8px rgba(255,255,255,.045)}}
+@media(max-width:620px){.working-dashboard{grid-template-columns:1fr}.working-gauge{min-height:165px;border-right:0;border-bottom:1px solid rgba(255,255,255,.11)}.working-gauge-ring{width:120px;height:120px}.working-overview{padding:14px}.working-current{min-height:0}}
+@media(prefers-reduced-motion:reduce){.working-gauge-ring,.working-live-dot{animation:none}}
 .diagnostic-result{box-shadow:none}

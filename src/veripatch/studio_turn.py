@@ -40,13 +40,7 @@ def next_after_tool(
         "tool_error", "capability_guard",
     }:
         return TurnNext.CONTINUE
-    if (
-        verification_command
-        and session.turn_changed_files
-        and session.verification_passed
-        and requirements_met
-    ):
-        return TurnNext.COMPLETE_VERIFIED
+    # Successful verification returns evidence to the model, not a finish action.
     if decision.action in _MUTATIONS:
         return TurnNext.FOLLOW_UP_MUTATION
     return TurnNext.CONTINUE

@@ -94,14 +94,14 @@ def test_no_enabled_skills_does_not_scan(tmp_path):
         assert selected(str(tmp_path), []) == []
 
 
-def test_pure_answer_skips_redundant_semantic_model_call(tmp_path):
+def test_primary_model_can_answer_when_auxiliary_classifier_is_unavailable(tmp_path):
     class Model:
         classify_calls = 0
         decide_calls = 0
 
         async def classify_intent(self, messages, message):
             self.classify_calls += 1
-            raise AssertionError("pure answer should not classify twice")
+            raise RuntimeError("auxiliary classifier unavailable")
 
         async def decide(self, context):
             self.decide_calls += 1
@@ -128,7 +128,7 @@ def test_pure_answer_skips_redundant_semantic_model_call(tmp_path):
     assert model.decide_calls == 1
 
 
-def test_skill_snapshot_shared_across_classification_and_steps(tmp_path):
+def test_skill_snapshot_shared_across_execution_steps(tmp_path):
     content = "---\nname: test-skill\ndescription: test\n---\noriginal instructions"
     install(str(tmp_path), content)
     answer = "开场\n\n问题\n\n参考内容" + "内容" * 400
@@ -137,17 +137,15 @@ def test_skill_snapshot_shared_across_classification_and_steps(tmp_path):
         calls = 0
 
         async def classify_intent(self, messages, message):
-            assert "original instructions" in messages[0]["content"]
-            (tmp_path / ".agents/skills/test-skill/SKILL.md").write_text(
-                content.replace("original", "new"), encoding="utf-8"
-            )
-            return SemanticIntentAssessment(
-                intent="answer", confidence="high", requires_clarification=False
-            )
+            raise AssertionError("No preflight intent call")
 
         async def decide(self, context):
             assert context["skills"]["selected"][0]["content"] == content
             self.calls += 1
+            if self.calls == 1:
+                (tmp_path / ".agents/skills/test-skill/SKILL.md").write_text(
+                    content.replace("original", "new"), encoding="utf-8"
+                )
             return StudioReply(
                 decision=StudioDecision(
                     action=StudioAction.LIST_FILES if self.calls == 1 else StudioAction.RESPOND,

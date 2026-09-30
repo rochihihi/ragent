@@ -180,6 +180,46 @@ def test_full_does_not_silently_override_task_denial(tmp_path):
     assert s.status == "waiting_permission"
 
 
+def test_model_action_hint_cannot_authorize_write(tmp_path):
+    from veripatch.studio_domain import StudioTaskContract
+
+    s = session(tmp_path, "full")
+    s.task_contract = StudioTaskContract(
+        objective="analyze only", intent="analysis",
+        allowed_actions=["read", "respond", "create"],
+        scope_actions=["read", "respond"],
+    )
+    agent = StudioAgent(None, StudioStore(tmp_path / "state.sqlite3"))
+    agent._execute(
+        s, SafeWorkspace(tmp_path),
+        StudioDecision(
+            action="create", rationale="model suggestion", path="bad.txt", content="bad"
+        ),
+    )
+    assert not (tmp_path / "bad.txt").exists()
+    assert s.pending_permission is not None
+
+
+def test_explicit_denial_cannot_be_overridden_by_full_mode_or_grant(tmp_path):
+    from veripatch.studio_domain import StudioTaskContract
+
+    s = session(tmp_path, "full")
+    s.task_contract = StudioTaskContract(
+        objective="do not create", intent="analysis",
+        allowed_actions=["create"], scope_actions=["create"],
+        denied_actions=["create"],
+    )
+    decision = StudioDecision(
+        action="create", rationale="model suggestion", path="bad.txt", content="bad"
+    )
+    s.once_grants.append(fingerprint(decision))
+    agent = StudioAgent(None, StudioStore(tmp_path / "state.sqlite3"))
+    agent._execute(s, SafeWorkspace(tmp_path), decision)
+    assert not (tmp_path / "bad.txt").exists()
+    assert s.pending_permission is None
+    assert any(item.kind == "capability_guard" for item in s.observations)
+
+
 @pytest.mark.parametrize("approved,scope", [(True, "once"), (True, "session"), (False, "once")])
 def test_api_approval_resumes_exact_decision(tmp_path, monkeypatch, approved, scope):
     from fastapi.testclient import TestClient

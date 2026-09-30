@@ -131,6 +131,8 @@ class CompletionCheck:
 def assess(session: StudioSession, unmet: list[str]) -> CompletionCheck:
     if session.pending_permission:
         return CompletionCheck("waiting_permission")
+    if session.verification_mode is not VerificationMode.STRICT:
+        return CompletionCheck("ready")
     if unmet:
         return CompletionCheck("blocked", tuple(unmet))
     if unresolved_verification_failure(session):
@@ -148,6 +150,8 @@ def assess(session: StudioSession, unmet: list[str]) -> CompletionCheck:
 
 def assess_response(session: StudioSession, unmet: list[str]) -> CompletionCheck:
     """Allow honest blocker reports, but not a premature answer for unfinished work."""
+    if session.verification_mode is not VerificationMode.STRICT:
+        return assess(session, [])
     pending_tools = TaskEvidence.pending_tools(session)
     if pending_tools and any(
         not TaskEvidence.failed_attempt(session, tool) for tool in pending_tools
@@ -157,7 +161,11 @@ def assess_response(session: StudioSession, unmet: list[str]) -> CompletionCheck
             tuple(f"本轮尚未取得 {tool} 的工具结果" for tool in pending_tools),
         )
     contract = session.task_contract
-    if contract is None or contract.intent in {"answer", "analysis"}:
+    if contract is None:
+        return CompletionCheck("ready")
+    if contract.intent in {"answer", "analysis"}:
+        if unmet and contract.evidence_required:
+            return CompletionCheck("blocked", tuple(unmet))
         return CompletionCheck("ready")
     check = assess(session, unmet)
     if check.state == "ready" or check.state == "waiting_permission":

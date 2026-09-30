@@ -53,6 +53,15 @@ class IntentPolicy:
     evidence_required: bool = False
 
 
+def model_intent_policy() -> IntentPolicy:
+    """Neutral context for model understanding; action safety is checked at execution."""
+    return IntentPolicy(
+        intent="unresolved", confidence="unknown",
+        rationale="由模型结合当前请求和会话上下文理解任务",
+        allowed_actions=frozenset(StudioAction),
+    )
+
+
 _CONTEXTUAL_CONTINUATIONS = {
     "接着做",
     "继续处理",
@@ -88,7 +97,7 @@ def semantic_policy(fallback: IntentPolicy, assessment: SemanticIntentAssessment
         and not fallback.launch_requested
     ):
         assessment.intent = "answer"
-    denied = set(fallback.denied_actions) | {
+    denied = {
         known[name] for name in assessment.prohibited_actions if name in known
     }
     allowed = set(READ_ACTIONS) | {StudioAction.REQUEST_PERMISSION}
@@ -123,7 +132,8 @@ def semantic_policy(fallback: IntentPolicy, assessment: SemanticIntentAssessment
         denied_actions=frozenset(denied),
         mutation_requested=effect_intent and bool(allowed & WRITE_ACTIONS),
         verification_requested=effect_intent and bool(requested & {StudioAction.RUN_TESTS}),
-        launch_requested=assessment.intent == "launch_only" and bool(allowed & COMMAND_ACTIONS),
+        launch_requested=(assessment.launch_requested or assessment.intent == "launch_only")
+        and bool(allowed & COMMAND_ACTIONS),
         evidence_required=fallback.evidence_required or bool(assessment.questions),
     )
 
@@ -385,6 +395,8 @@ def classify_intent(message: str) -> IntentPolicy:
 
 
 def denied_action_reason(contract: StudioTaskContract, action: StudioAction) -> str | None:
+    if action.value in contract.denied_actions:
+        return f"用户明确禁止 {action.value}。"
     if not contract.allowed_actions:
         return None
     if action is StudioAction.BATCH:

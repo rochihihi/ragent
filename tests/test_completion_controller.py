@@ -4,16 +4,18 @@ from unittest.mock import patch
 
 import pytest
 
+from veripatch import studio_completion as completion
 from veripatch.studio_agent import StudioAgent
 from veripatch.studio_domain import (
     ObservationOutcome,
+    SemanticIntentAssessment,
     StudioAction,
     StudioDecision,
     StudioMessage,
     StudioObservation,
-    StudioSession,
-    StudioRequirement,
     StudioReply,
+    StudioRequirement,
+    StudioSession,
     StudioTaskContract,
     StudioTaskState,
     VerificationMode,
@@ -21,7 +23,6 @@ from veripatch.studio_domain import (
 from veripatch.studio_store import StudioStore
 from veripatch.studio_tools import TERMINALS, inspect_visible_processes
 from veripatch.workspace import SafeWorkspace
-from veripatch import studio_completion as completion
 
 
 def setup(tmp_path):
@@ -39,6 +40,7 @@ def setup(tmp_path):
 
 def test_response_gate_requires_effect_after_stale_tool_failure(tmp_path):
     _, session, _ = setup(tmp_path)
+    session.verification_mode = VerificationMode.STRICT
     session.task_contract = StudioTaskContract(objective="修改文件", intent="change")
     session.observations.extend([
         StudioObservation(kind="tool_error", summary="old failure", payload={"action": "read"}),
@@ -77,6 +79,7 @@ def test_text_edit_move_copy_complete_without_commands(tmp_path):
 
 def test_completion_rejection_stops_without_new_evidence(tmp_path):
     agent, session, workspace = setup(tmp_path)
+    session.verification_mode = VerificationMode.STRICT
     agent._execute(
         session,
         workspace,
@@ -90,7 +93,7 @@ def test_completion_rejection_stops_without_new_evidence(tmp_path):
     assert "请提出具体的修改要求" not in session.messages[-1].content
 
 
-def test_rejected_finish_exposes_unmet_goal_and_refreshes_files(tmp_path):
+def test_default_finish_is_model_owned_even_with_advisory_unmet_goal(tmp_path):
     (tmp_path / "old.txt").write_text("existing", encoding="utf-8")
     agent, session, _ = setup(tmp_path)
     session.status = "idle"
@@ -98,6 +101,10 @@ def test_rejected_finish_exposes_unmet_goal_and_refreshes_files(tmp_path):
     class Model:
         def __init__(self):
             self.contexts = []
+
+        async def classify_intent(self, messages, message):
+            return SemanticIntentAssessment(intent="change", confidence="high",
+                requires_clarification=False, requested_actions=["create"])
 
         async def decide(self, context):
             self.contexts.append(context)
@@ -123,8 +130,10 @@ def test_rejected_finish_exposes_unmet_goal_and_refreshes_files(tmp_path):
     agent.model = model
     result = asyncio.run(agent.handle(session, "新建一个说明文件"))
     assert result.status == "completed"
-    assert result.turn_changed_files == ["new.txt"]
-    assert len(model.contexts) == 3
+    assert result.turn_changed_files == []
+    assert len(model.contexts) == 1
+    assert model.contexts[0]["completion"]["authority"] == "model"
+    assert not any(item.kind == "requirement_gate" for item in result.observations)
 
 
 def test_repeating_paused_request_keeps_its_file_evidence(tmp_path):
@@ -327,6 +336,70 @@ def test_terminal_action_cannot_restart_a_tracked_gui_launch(tmp_path):
     assert session.observations[-1].kind == "launch_reused"
 
 
+@pytest.mark.parametrize("later_path", ["app.test.js", "index.html"])
+def test_later_mutation_does_not_require_reopening_artifact(tmp_path, later_path):
+    agent, session, workspace = setup(tmp_path)
+    session.turn_changed_files = ["index.html", later_path]
+    session.task_contract = StudioTaskContract(
+        objective="创建计算器并打开", intent="change",
+        requirements=[StudioRequirement(key="launch_after_change", description="打开新产物")],
+    )
+    session.observations.extend([
+        StudioObservation(kind="create", summary="创建页面", payload={"path": "index.html"}),
+        StudioObservation(kind="command", summary="系统接受打开请求", payload={
+            "command": ["cmd", "/c", "start", "", "index.html"],
+            "execution_role": "launch", "launch_target": "index.html",
+            "exit_code": 0, "launch_state": "dispatched", "window_confirmed": None,
+        }),
+        StudioObservation(kind="create", summary="后续变更", payload={"path": later_path}),
+    ])
+    assert StudioAgent._validate_task_contract(session) == []
+    assert agent._reuse_launch(session, workspace, "index.html")
+    assert session.observations[-1].kind == "launch_reused"
+
+
+def test_default_completion_does_not_reopen_after_adding_test_file(tmp_path):
+    agent, session, workspace = setup(tmp_path)
+    session.task_contract = StudioTaskContract(
+        objective="创建计算器并打开", intent="change",
+        requirements=[StudioRequirement(key="launch_after_change", description="打开新产物")],
+    )
+    agent._execute(session, workspace, StudioDecision(
+        action="create", path="index.html", content="<title>Calculator</title>", rationale="create",
+    ))
+    session.observations.append(StudioObservation(kind="command", summary="系统接受打开请求", payload={
+        "command": ["cmd", "/c", "start", "", "index.html"],
+        "execution_role": "launch", "launch_target": "index.html",
+        "exit_code": 0, "launch_state": "dispatched",
+    }))
+    agent._execute(session, workspace, StudioDecision(
+        action="create", path="app.test.js", content="// test fixture", rationale="add test",
+    ))
+    assert agent._execute(session, workspace, StudioDecision(
+        action="finish", message="已创建并请求打开页面；尚未运行测试。", rationale="done",
+    ))
+    assert session.status == "completed"
+    assert sum(item.kind == "command" for item in session.observations) == 1
+    assert not any(item.kind in {"requirement_gate", "verification_gate"} for item in session.observations)
+
+
+def test_previous_turn_launch_does_not_satisfy_current_task(tmp_path):
+    _, session, _ = setup(tmp_path)
+    session.verification_mode = VerificationMode.STRICT
+    session.turn_changed_files = ["index.html"]
+    session.task_contract = StudioTaskContract(
+        objective="创建并打开", intent="change",
+        requirements=[StudioRequirement(key="launch_after_change", description="打开新产物")],
+    )
+    session.observations.append(StudioObservation(kind="command", summary="旧任务启动", payload={
+        "command": ["cmd", "/c", "start", "", "index.html"],
+        "execution_role": "launch", "launch_target": "index.html",
+        "exit_code": 0, "launch_state": "dispatched",
+    }))
+    session.turn_observation_start = 1
+    assert StudioAgent._validate_task_contract(session) == ["打开新产物"]
+
+
 def test_polling_existing_terminal_can_confirm_the_window(tmp_path):
     agent, session, workspace = setup(tmp_path)
     agent._execute(
@@ -483,6 +556,7 @@ def test_prior_turn_change_cannot_complete_a_new_change_request(tmp_path):
     from veripatch.studio_completion import assess
 
     agent, session, workspace = setup(tmp_path)
+    session.verification_mode = VerificationMode.STRICT
     agent._execute(
         session,
         workspace,
@@ -567,6 +641,38 @@ def test_verified_fallback_never_leaves_running(tmp_path):
     agent, session, workspace = setup(tmp_path)
     agent._finish_from_verified_evidence(session, workspace, "fallback")
     assert session.status != "running"
+
+
+@pytest.mark.parametrize("kind", ["command", "test"])
+def test_verification_target_requires_current_matching_success(tmp_path, kind):
+    _, session, _ = setup(tmp_path)
+    session.changed_files = ["app.py"]
+    session.task_contract = StudioTaskContract(
+        objective="验证 app.py", intent="verify",
+        requirements=[StudioRequirement(key="target_file", description="验证目标", expected="app.py")],
+    )
+    assert StudioAgent._validate_task_contract(session)
+    session.observations.append(StudioObservation(
+        kind=kind, summary="检查完成",
+        payload={"command": ["python", "-m", "py_compile", "other.py"],
+                 "exit_code": 0, "execution_role": "verification"},
+    ))
+    assert StudioAgent._validate_task_contract(session)
+    session.observations[-1].payload["command"][-1] = "app.py"
+    session.observations[-1].payload["exit_code"] = 1
+    assert StudioAgent._validate_task_contract(session)
+    session.observations[-1].payload["exit_code"] = 0
+    assert StudioAgent._validate_task_contract(session) == []
+
+
+def test_read_only_answer_requires_requested_evidence(tmp_path):
+    _, session, _ = setup(tmp_path)
+    session.verification_mode = VerificationMode.STRICT
+    session.task_contract = StudioTaskContract(
+        objective="读取 app.py，说明它做了什么", intent="analysis", evidence_required=True,
+    )
+    assert completion.assess_response(session, ["尚未读取 app.py"]).state == "blocked"
+    assert completion.assess_response(session, []).state == "ready"
 
 
 def test_public_loop_never_returns_orphan_running_state(tmp_path):
@@ -659,6 +765,7 @@ def test_failed_test_is_not_cleared_by_unrelated_static_check(tmp_path):
     from veripatch.studio_domain import StudioObservation
 
     _agent, session, _workspace = setup(tmp_path)
+    session.verification_mode = VerificationMode.STRICT
     session.turn_changed_files = ["app.py"]
     session.observations.extend(
         [

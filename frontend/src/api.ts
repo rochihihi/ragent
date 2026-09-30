@@ -16,7 +16,7 @@ export type Session = {
   activity?: "idle" | "preparing_context" | "waiting_model" | "retrying_model" | "executing_tool" | "waiting_permission" | "paused" | "completed" | "failed";
   pause_reason?: string | null;
   step: number;
-  turn_budget?: number;
+  turn_budget?: number | null;
   context_estimated_tokens?: number;
   context_actual_input_tokens?: number | null;
   context_limit_tokens?: number;
@@ -87,7 +87,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   sessions: () => request<Session[]>("/studio-api/sessions"),
   session: (id: string) => request<Session>(`/studio-api/sessions/${id}`),
-  events: (id: string) => request<Event[]>(`/studio-api/sessions/${id}/events`),
+  events: (id: string) => request<Event[]>(`/studio-api/sessions/${id}/events?full=true`),
   files: (id: string) => request<{ files: string[]; directories: string[] }>(`/studio-api/sessions/${id}/files`),
   createProjectEntry: (id: string, kind: "file" | "folder", path: string) => request<{ kind: string; path: string }>(`/studio-api/sessions/${id}/files`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind, path }) }),
   git: (id: string, path?: string) => request<GitPanelData>(`/studio-api/sessions/${id}/git${path ? `?path=${encodeURIComponent(path)}` : ""}`),
@@ -96,6 +96,8 @@ export const api = {
   createSession: (body: object) => request<{ session_id: string }>("/studio-api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   deleteSession: (id: string) => request<void>(`/studio-api/sessions/${id}`, { method: "DELETE" }),
   send: (id: string, content: string) => request<{ status: string }>(`/studio-api/sessions/${id}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content }) }),
+  pause: (id: string) => request<{ status: string }>(`/studio-api/sessions/${id}/pause`, { method: "POST" }),
+  resume: (id: string) => request<{ status: string }>(`/studio-api/sessions/${id}/resume`, { method: "POST" }),
   updateSettings: (id: string, body: object) => request<Session>(`/studio-api/sessions/${id}/settings`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   decidePermission: (id: string, requestId: string, approved: boolean, instruction?: string, scope = "once") => request<{ status: string }>(`/studio-api/sessions/${id}/permissions/${requestId}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ approved, scope, instruction: instruction || null }) }),
   providers: () => request<ProviderState>("/providers"),
