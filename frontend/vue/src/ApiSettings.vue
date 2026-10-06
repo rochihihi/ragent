@@ -1,0 +1,30 @@
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from "vue";
+import { api, type Provider, type ProviderState, type Quota } from "../../src/api";
+import Modal from "./Modal.vue";
+import { providers } from "./useWorkspace";
+const emit = defineEmits<{ close: [] }>();
+const provider = ref<Provider>("deepseek"), states = ref<ProviderState | null>(null), models = ref<Record<Provider, { selected: string; choices: string[] }> | null>(null);
+const quotas = ref<Partial<Record<Provider, Quota>>>({}), key = ref(""), base = ref("https://api.openai.com/v1"), selected = ref(""), quotaToken = ref(""), quotaRefreshToken = ref(""), quotaUserId = ref(""), notice = ref(""), testing = ref(false), refreshing = ref(false), testResult = ref<{ ok: boolean; text: string } | null>(null);
+const choices = computed(() => models.value?.[provider.value]?.choices || []);
+function quotaText(value?: Quota) { if (!value) return "未查询"; if (!value.supported) return "平台查看"; if (!value.configured) return "未配置"; if (value.error) return "查询失败"; const balance = value.balances[0]; return balance ? `${balance.currency} ${balance.total_balance}` : "可用"; }
+async function load() { const [s, m] = await Promise.all([api.providers(), api.models()]); states.value = s; models.value = m; base.value = s.openai.base_url || "https://api.openai.com/v1"; quotaUserId.value = s.openai.quota_user_id || ""; selected.value = m[provider.value].selected; }
+async function refreshQuotas() { refreshing.value = true; try { const results = await Promise.allSettled([api.quota("deepseek"), api.quota("openai"), api.quota("openai_official")]); quotas.value = { deepseek: results[0].status === "fulfilled" ? results[0].value : quotas.value.deepseek, openai: results[1].status === "fulfilled" ? results[1].value : quotas.value.openai, openai_official: results[2].status === "fulfilled" ? results[2].value : quotas.value.openai_official }; } finally { refreshing.value = false; } }
+async function discover() { if (provider.value === "deepseek") return; try { const current = provider.value as "openai" | "openai_official"; const result = await api.discoverModels(current, current === "openai_official" ? "https://api.openai.com/v1" : base.value, key.value); if (models.value) models.value = { ...models.value, [current]: { selected: result.models[0] || selected.value, choices: result.models } }; selected.value = result.models.includes(selected.value) ? selected.value : (result.models[0] || selected.value); notice.value = `读取到 ${result.models.length} 个模型`; } catch (e) { notice.value = (e as Error).message; } }
+async function save() { try { if (key.value) await api.saveKey(provider.value, key.value); if (provider.value === "openai") await api.saveOpenAI(base.value, selected.value, quotaToken.value, quotaRefreshToken.value, quotaUserId.value); else await api.saveModel(provider.value, selected.value); notice.value = "配置已保存"; key.value = ""; quotaToken.value = ""; quotaRefreshToken.value = ""; await load(); } catch (e) { notice.value = (e as Error).message; } }
+async function testConnection() { testing.value = true; testResult.value = null; try { const result = await api.testConnection(provider.value, selected.value, provider.value === "openai" ? base.value : undefined, key.value); testResult.value = { ok: result.ok, text: `${result.status_code ? `HTTP ${result.status_code} · ` : ""}${result.latency_ms} ms · ${result.message}` }; } catch (e) { testResult.value = { ok: false, text: (e as Error).message }; } finally { testing.value = false; } }
+watch(provider, () => { key.value = ""; testResult.value = null; void load().catch(e => { notice.value = e.message; }); });
+onMounted(() => void Promise.all([load(), refreshQuotas()]).catch(e => { notice.value = e.message; }));
+</script>
+<template>
+  <Modal title="API 配置" :wide="true" @close="emit('close')">
+    <section class="quota-panel"><header><div><strong>额度概览</strong><small>可用时读取供应商真实额度</small></div><button :disabled="refreshing" @click="refreshQuotas">{{ refreshing ? '读取中…' : '刷新' }}</button></header><div><article v-for="item in (['deepseek', 'openai', 'openai_official'] as Provider[])" :key="item"><span>{{ item === 'deepseek' ? 'DeepSeek' : item === 'openai' ? 'OpenAI / 中转站' : 'OpenAI 官方' }}</span><strong>{{ quotaText(quotas[item]) }}</strong><small>{{ item === 'openai_official' ? '官方 API Key 请在 OpenAI 平台查看用量。' : quotas[item]?.error || '最近一次额度状态' }}</small></article></div></section>
+    <div class="provider-tabs"><button v-for="item in providers" :key="item[0]" :class="{ active: provider === item[0] }" @click="provider = item[0]">{{ item[1] }}</button></div>
+    <p class="credential-state">{{ states?.[provider]?.configured ? `● 已配置 · ${states[provider].source}` : '○ 尚未配置' }}</p>
+    <label>API Key<input v-model="key" type="password" :placeholder="states?.[provider]?.configured ? '输入新密钥可更新' : '粘贴 API Key'" /></label>
+    <template v-if="provider === 'openai'"><label>兼容 Base URL<div class="path-row"><input v-model="base" /><button @click="discover">读取模型</button></div></label><label>Sub2API auth_token（可选）<input v-model="quotaToken" type="password" /></label><label>refresh_token（可选）<input v-model="quotaRefreshToken" type="password" /></label><label>NewAPI 用户 ID（可选）<input v-model="quotaUserId" /></label></template>
+    <label>默认模型<select v-model="selected"><option v-for="item in choices" :key="item">{{ item }}</option></select></label><button v-if="provider === 'openai_official'" @click="discover">读取官方模型</button>
+    <section class="connection-test" :class="{ success: testResult?.ok, failure: testResult && !testResult.ok }"><div><strong>连接测试</strong><small>使用当前密钥、地址和模型发送一个最小请求</small></div><button :disabled="testing || !selected" @click="testConnection">{{ testing ? '测试中…' : '测试是否可用' }}</button><p v-if="testResult">{{ testResult.text }}</p></section>
+    <p v-if="notice" class="notice">{{ notice }}</p><div class="form-actions"><button @click="emit('close')">关闭</button><button class="primary" @click="save">保存配置</button></div>
+  </Modal>
+</template>

@@ -1,0 +1,17 @@
+.vue-badge{flex:none;font-size:11px;padding:4px 9px;border:1px solid #5f9d86;border-radius:8px;color:#67cfa6;margin-right:12px}
+/* FileTree uses the shared project-panel grid (arrow, name, state).  Do not
+   override it with a flex row: that pushes names toward the right edge. */
+.vue-file-list .folder-children{margin-left:12px;border-left:1px solid var(--line);padding-left:4px}
+.vue-form textarea{width:100%;padding:10px;border-radius:9px;border:1px solid var(--line);background:var(--surface);color:inherit;resize:vertical}
+.vue-form fieldset{border:0;padding:0;min-width:0}
+.vue-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.vue-toolbar button{padding:7px 12px;border-radius:9px;border:1px solid var(--line);background:var(--surface);color:inherit}
+.vue-notice{white-space:pre-wrap;overflow-wrap:anywhere;padding:10px;border:1px solid var(--line);border-radius:8px}
+.vue-code{white-space:pre-wrap;overflow-wrap:anywhere;max-height:45vh;overflow:auto;padding:16px;background:#16181c;color:#e6e6e6;border-radius:10px;font:12px/1.6 Consolas,monospace}
+.vue-settings-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.vue-settings-tabs .active{border-color:#67cfa6}
+.vue-check{display:flex!important;align-items:center;gap:8px!important}.vue-check input{width:auto!important}
+.message-content pre{overflow:auto;white-space:pre;max-width:100%;padding:16px;background:#151719;border-radius:10px}
+.message-content table{border-collapse:collapse}.message-content th,.message-content td{border:1px solid var(--line);padding:6px 10px}
+.vue-git-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px}.vue-git-layout button{width:100%;text-align:left}
+.vue-wide{width:min(960px,95vw)}
+@media(max-width:760px){.vue-git-layout{grid-template-columns:1fr}.vue-badge{display:none}}

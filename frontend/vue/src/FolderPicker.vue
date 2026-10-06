@@ -1,0 +1,12 @@
+<script setup lang="ts">
+import { onMounted, ref } from "vue";
+import { api } from "../../src/api";
+const emit = defineEmits<{ select: [path: string]; close: [] }>();
+const data = ref<{ current: string | null; parent: string | null; directories: Array<{ name: string; path: string }> } | null>(null), selected = ref<string | null>(null), loading = ref(false), error = ref(""), creating = ref(false), folderName = ref("");
+async function load(path?: string) { loading.value = true; error.value = ""; try { data.value = await api.directories(path); selected.value = null; } catch (e) { error.value = (e as Error).message; } finally { loading.value = false; } }
+async function createFolder() { if (!data.value?.current || !folderName.value.trim()) return; loading.value = true; error.value = ""; try { const created = await api.createDirectory(data.value.current, folderName.value.trim()); await load(data.value.current); selected.value = created.path; folderName.value = ""; creating.value = false; } catch (e) { error.value = (e as Error).message; loading.value = false; } }
+onMounted(() => void load());
+</script>
+<template>
+  <div class="folder-pop"><header><strong>选择文件夹</strong><nav><button :disabled="!data?.current" @click="creating = !creating">＋ 新建文件夹</button><button @click="emit('close')">×</button></nav></header><div class="folder-location"><p :title="data?.current || '此电脑'">{{ data?.current || '此电脑' }}</p><div v-if="creating" class="new-folder-row"><input v-model="folderName" autofocus placeholder="输入文件夹名称" @keydown.enter="createFolder" @keydown.esc="creating = false" /><button :disabled="!folderName.trim() || loading" @click="createFolder">创建</button></div></div><div class="folder-list"><button @click="load(data?.parent || undefined)">↰ {{ data?.parent ? '上一级' : '返回此电脑' }}</button><span v-if="loading" class="folder-hint">正在读取文件夹…</span><button v-for="directory in data?.directories || []" v-else :key="directory.path" :class="{ selected: selected === directory.path }" :title="'单击选中，双击打开'" @click="selected = directory.path" @dblclick="load(directory.path)">📁 {{ directory.name }}</button><span v-if="error" class="folder-error">{{ error }}</span></div><footer><small>{{ selected ? '已选中此文件夹；双击可继续进入' : '单击选择，双击打开文件夹' }}</small><button class="primary" :disabled="!selected && !data?.current || loading" @click="emit('select', selected || data?.current || '')">选择此文件夹</button></footer></div>
+</template>

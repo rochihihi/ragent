@@ -1,0 +1,53 @@
+.drawer button.active {
+  color: #fff;
+  border-color: #292c33;
+  background: #292c33;
+  box-shadow: 0 5px 16px rgba(25, 28, 34, 0.18);
+}
+
+.drawer .drawer-close {
+  margin-left: 5px;
+  border-radius: 50%;
+}
+
+.source-view {
+  margin: 0;
+  overflow: auto;
+  padding: 22px;
+  color: #d9dce3;
+  background: #111318;
+  font: 12px/1.65 Consolas, monospace;
+  white-space: pre;
+}
+
+.diff-view {
+  overflow: auto;
+  padding: 18px 0 28px;
+  color: #d9dce3;
+  background: #111318;
+  font: 12px/1.62 Consolas, monospace;
+}
+
+.diff-line {
+  display: grid;
+  grid-template-columns: 46px 46px minmax(max-content, 1fr);
+  min-height: 21px;
+  border-left: 3px solid transparent;
+}
+
+.diff-line code { padding: 0 16px 0 12px; white-space: pre; }
+.diff-line .line-number {
+  padding-right: 9px;
+  color: #626975;
+  background: rgba(255, 255, 255, 0.018);
+  text-align: right;
+  user-select: none;
+}
+.diff-line.added { border-left-color: #3dc778; background: rgba(42, 177, 101, 0.2); }
+.diff-line.added code { color: #c8f6d9; }
+.diff-line.removed { border-left-color: #ff6b72; background: rgba(232, 72, 81, 0.22); }
+.diff-line.removed code { color: #ffd2d4; }
+.diff-line.hunk { margin: 9px 0; color: #a9c8ff; background: rgba(78, 125, 211, 0.16); }
+.diff-line.file { color: #8f98a7; background: #171a21; }
+.diff-line:hover { filter: brightness(1.12); }
+.diff-empty { display: grid; place-items: center; color: #8d939e; background: #111318; }
