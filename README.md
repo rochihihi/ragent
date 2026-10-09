@@ -14,6 +14,7 @@ Local-first does not mean offline inference: selected project content is sent to
 
 - **Model-led workflow:** one Studio runtime. The model interprets the original request and chooses tools, plans, verification, and responses. Plans do not grant permissions.
 - **Desktop workspace:** persistent conversations, project tree, file creation, Diff review, Git operations, skills, execution history, and per-request context usage.
+- **Skill packages:** folder/ZIP imports with scripts and references, safe YAML parsing, automatic/pinned/disabled session modes, `$name` invocation, and three-tier loading. Updates, removal, and legacy Windows permission repairs preserve backups. [Skill guide](docs/skills.md).
 - **Controlled execution:** concrete command/argument previews, one-time and matching session approvals, native workspace path checks, and protected repository metadata.
 - **Pause/resume:** no default fixed decision-step limit. Pending model I/O can be cancelled; synchronous tools finish and save results before pausing. Ambiguous recovered calls are not blindly replayed.
 - **Verification:** the model chooses relevant checks and may write tests. Failures return as tool evidence. Default modes do not enforce a test-and-reopen sequence; Strict adds completion gates. Completion is not proof of passing tests or visual GUI inspection.
@@ -45,6 +46,7 @@ cd RAgent
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev,desktop]"
 npm --prefix frontend ci
+npm --prefix sandbox/runtime ci --ignore-scripts --registry=https://registry.npmjs.org
 npm --prefix frontend run build
 .\.venv\Scripts\ragent-desktop.exe
 ```
@@ -54,6 +56,8 @@ Configure a provider in the app, choose a project folder, and create a conversat
 The old `ragent`/`veripatch` CLI, including `serve`, `auth`, and `quota`, is removed. Desktop launchers remain; credentials and balance queries are managed in the GUI. Balance-query support depends on the provider/gateway.
 
 ## Build the Windows executable
+
+Download the packaged Windows app from [GitHub Releases](https://github.com/rochihihi/RAgent/releases/latest). It still needs WebView2, a configured model provider, and setup of the experimental Windows sandbox. Python-based skill scripts need an external Python interpreter.
 
 After installing the dependencies:
 
@@ -69,23 +73,27 @@ Configure servers in MCP service management. Configuration normally resides at `
 
 Only enable trusted servers: they may execute programs, modify data, or contact networks outside native file-tool safeguards. Approval is not a sandbox for third-party services.
 
+Commands, tests, Git subprocesses and local stdio MCP now use a required-by-default experimental OS sandbox. Open Settings → Execution sandbox to check/setup the Windows alpha backend; no automatic elevation or unsandboxed fallback. Remote HTTP MCP effects remain outside this boundary. See [sandbox setup and limitations](docs/SANDBOX.md).
+
 See [external MCP setup](docs/EXTERNAL_MCP.md). Current limitations: no OAuth flow, legacy HTTP SSE transport, or persistent connection reuse.
 
 ## Development checks
 
 ```powershell
+.\.venv\Scripts\python.exe -m pytest
 npm --prefix frontend run check:vue
+npm --prefix frontend run test:trace
 npm --prefix frontend run build
 ```
 
-This source-only release includes the runtime, Vue interface, build script, and required resources. Local regression suites, generated executables, and backups are not published. The in-app acceptance checks remain available and run production code without model calls.
+Tests cover model decisions, call identity, permissions, pause/resume, context summaries, file conflicts/rollback, persistence, and external MCP. Passing tests validate covered cases, not every provider or desktop environment.
 
 ## Layout and stack
 
 ```text
 src/veripatch/   Studio runtime, adapters, tools, API, persistence
 frontend/vue/   Vue 3 desktop interface
-frontend/src/   Shared API types, utilities, and styles
+tests/          Unit and integration tests
 scripts/        Desktop build script
 assets/         Desktop resources and screenshot
 examples/       Example projects
@@ -97,6 +105,8 @@ Python, Pydantic, FastAPI/Uvicorn, SQLite, Vue 3/TypeScript/Vite, PyWebView, MCP
 ## Safety
 
 Keep the local API on loopback; it is not a public execution service. Native file tools protect paths and metadata, but approved commands and external tools can have broader effects. Review destructive operations and use Git/backups for important work.
+
+Sandbox approvals and execution isolation are separate. Desktop GUI and other incompatible operations can propose a per-call host exception, with fresh explicit approval rather than full/session grants; other calls remain sandboxed. Strict policy can forbid exceptions. Host calls have current-user access, not sandbox protection. Windows SRT is alpha, not a production-grade security guarantee.
 
 Credentials are handled separately from model context, but files and tool output may contain secrets. Inspect what you expose to providers and external services.
 

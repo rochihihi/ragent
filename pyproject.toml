@@ -9,6 +9,7 @@ description = "A verifiable, recoverable repository-level software repair agent.
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "PyYAML>=6,<7",
   "mcp>=1.20,<2",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",

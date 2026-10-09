@@ -14,10 +14,27 @@ runs/
 dist/
 build/
 frontend/node_modules/
+sandbox/runtime/node_modules/
+.npm-sandbox-cache/
 frontend/dist/
 frontend/dist-vue/
 *.spec
 *.egg-info/
+
+# Local regression outputs, packaging backups, and publication copies
+.test-*/
+.test-*-results.xml
+.pytest-tmp/
+.backup-before-*/
+.answerfix-*/
+.docfix-*/
+.build-*/
+.package-*/
+.validation-*/
+.release-*/
+.publish-*/
+dist-rebuild-*/
+debug.log
 
 # Evaluation repositories and generated artifacts
 benchmarks/repos/

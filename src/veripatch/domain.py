@@ -28,6 +28,8 @@ class TestOutcome(BaseModel):
     pid: int | None = None
     launch_state: str | None = None
     window_confirmed: bool | None = None
+    sandboxed: bool = False
+    execution_mode: str | None = None
 
     @property
     def passed(self) -> bool:

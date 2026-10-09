@@ -84,7 +84,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json();
 }
 
+export async function sandboxHeaders() {
+  const key = await window.pywebview?.api?.sandbox_token?.();
+  if (!key) throw new Error("沙箱设置和沙箱外执行审批只能在 RAgent 桌面窗口操作；普通浏览器没有此授权。");
+  return { "content-type": "application/json", "x-veripatch-ui": "1", "x-ragent-sandbox-key": key };
+}
+
 export const api = {
+  sandboxSettings: () => request<{ settings: SandboxSettings; policy: { windows_alpha: boolean; scope: string; read_policy: string }; configuration_path: string }>("/sandbox-api/settings"),
+  saveSandbox: async (settings: SandboxSettings, confirm_unrestricted: boolean) => request("/sandbox-api/settings", { method: "PUT", headers: await sandboxHeaders(), body: JSON.stringify({ settings, confirm_unrestricted }) }),
+  probeSandbox: async () => request<{ ready: boolean; startupVerified?: boolean; errors: string[]; warnings: string[] }>("/sandbox-api/probe", { method: "POST", headers: await sandboxHeaders() }),
+  installSandbox: async () => request<{ cancelled?: boolean }>("/sandbox-api/install", { method: "POST", headers: await sandboxHeaders(), body: JSON.stringify({ confirm_system_changes: true }) }),
   sessions: () => request<Session[]>("/studio-api/sessions"),
   session: (id: string) => request<Session>(`/studio-api/sessions/${id}`),
   events: (id: string) => request<Event[]>(`/studio-api/sessions/${id}/events?full=true`),
@@ -99,7 +109,7 @@ export const api = {
   pause: (id: string) => request<{ status: string }>(`/studio-api/sessions/${id}/pause`, { method: "POST" }),
   resume: (id: string) => request<{ status: string }>(`/studio-api/sessions/${id}/resume`, { method: "POST" }),
   updateSettings: (id: string, body: object) => request<Session>(`/studio-api/sessions/${id}/settings`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-  decidePermission: (id: string, requestId: string, approved: boolean, instruction?: string, scope = "once") => request<{ status: string }>(`/studio-api/sessions/${id}/permissions/${requestId}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ approved, scope, instruction: instruction || null }) }),
+  decidePermission: async (id: string, requestId: string, approved: boolean, instruction?: string, scope = "once") => request<{ status: string }>(`/studio-api/sessions/${id}/permissions/${requestId}`, { method: "POST", headers: window.pywebview?.api?.sandbox_token ? await sandboxHeaders() : { "content-type": "application/json" }, body: JSON.stringify({ approved, scope, instruction: instruction || null }) }),
   providers: () => request<ProviderState>("/providers"),
   quota: (provider: Provider) => request<Quota>(`/providers/${provider}/quota`),
   models: () => request<Record<Provider, { selected: string; choices: string[] }>>("/provider-models"),
@@ -113,3 +123,5 @@ export const api = {
   directories: (path?: string) => request<{ current: string | null; parent: string | null; directories: Array<{ name: string; path: string }> }>(`/system/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`, { headers: { "x-veripatch-ui": "1" } }),
   createDirectory: (parent: string, name: string) => request<{ name: string; path: string }>("/system/directories", { method: "POST", headers: { "content-type": "application/json", "x-veripatch-ui": "1" }, body: JSON.stringify({ parent, name }) }),
 };
+
+export type SandboxSettings = { mode: "required" | "off"; allow_approved_host_execution: boolean; allowed_domains: string[]; tool_read_paths: string[] };

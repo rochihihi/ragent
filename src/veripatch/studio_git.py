@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from veripatch import studio_sandbox
 
 
 class GitToolError(RuntimeError):
@@ -27,15 +28,12 @@ class StudioGit:
         if (resolved / ".git").exists():
             raise GitToolError("当前工作区已经是 Git 仓库")
         safe_branch = cls._safe_branch(branch)
-        completed = subprocess.run(
+        completed = studio_sandbox.run(
+            resolved,
             ["git", "init", "-b", safe_branch],
-            cwd=resolved,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            {},
             timeout=30,
-            check=False,
+            encoding="utf-8",
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "Git init failed").strip()
@@ -50,22 +48,23 @@ class StudioGit:
             for key, value in os.environ.items()
             if not any(secret in key.casefold() for secret in ("api_key", "token", "secret"))
         }
-        completed = subprocess.run(
-            ["git", *args],
-            cwd=self.root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        argv = ["git", *args]
+        if studio_sandbox.settings().mode == "required":
+            # The dedicated Windows account does not own this checkout.
+            argv = ["git", "-c", f"safe.directory={self.root}", *args]
+        completed = studio_sandbox.run(
+            self.root,
+            argv,
+            env,
             timeout=timeout,
-            check=False,
-            env=env,
+            encoding="utf-8",
         )
         payload = {
             "argv": ["git", *args],
             "exit_code": completed.returncode,
             "stdout": completed.stdout[-40_000:],
             "stderr": completed.stderr[-12_000:],
+            "sandboxed": getattr(completed, "sandboxed", False),
         }
         if completed.returncode not in allowed_exit_codes:
             detail = (completed.stderr or completed.stdout or "Git command failed").strip()
@@ -82,9 +81,9 @@ class StudioGit:
     def diff(self, path: str | None = None, revision: str | None = None) -> dict[str, Any]:
         safe_path = self._safe_path(path) if path else None
         if safe_path and not revision:
-            untracked = self._run(
-                "ls-files", "--others", "--exclude-standard", "--", safe_path
-            )["stdout"].splitlines()
+            untracked = self._run("ls-files", "--others", "--exclude-standard", "--", safe_path)[
+                "stdout"
+            ].splitlines()
             if safe_path in untracked:
                 payload = self._run(
                     "diff",
@@ -158,14 +157,12 @@ class StudioGit:
         return payload
 
     def has_commits(self) -> bool:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=self.root,
-            capture_output=True,
-            timeout=10,
-            check=False,
+        return (
+            self._run("rev-parse", "--verify", "HEAD", timeout=10, allowed_exit_codes=(0, 128))[
+                "exit_code"
+            ]
+            == 0
         )
-        return completed.returncode == 0
 
     def commit(self, message: str, paths: list[str]) -> dict[str, Any]:
         clean_message = " ".join(message.split()).strip()
@@ -194,9 +191,7 @@ class StudioGit:
     def _safe_path(self, value: str) -> str:
         supplied = Path(value)
         candidate = (
-            supplied.resolve()
-            if supplied.is_absolute()
-            else (self.root / supplied).resolve()
+            supplied.resolve() if supplied.is_absolute() else (self.root / supplied).resolve()
         )
         if not candidate.is_relative_to(self.root) or candidate == self.root:
             raise GitToolError(f"Git 路径必须位于当前仓库内：{value}")

@@ -5,16 +5,21 @@
   "type": "module",
   "scripts": {
     "dev": "vite --config vue/vite.config.ts --host 127.0.0.1 --port 5173",
-    "build": "vite build --config vue/vite.config.ts --outDir ../dist",
+    "build": "vite build --config vue/vite.config.ts",
     "check": "vue-tsc --noEmit -p vue/tsconfig.json",
-    "dev:vue": "vite --config vue/vite.config.ts --host 127.0.0.1",
-    "build:vue": "vite build --config vue/vite.config.ts",
-    "check:vue": "vue-tsc --noEmit -p vue/tsconfig.json"
+    "dev:vue": "npm run dev",
+    "build:vue": "npm run build",
+    "check:vue": "vue-tsc --noEmit -p vue/tsconfig.json",
+    "test:drag": "node scripts/verify-effort-drag.mjs",
+    "test:trace": "node scripts/verify-event-summary.mjs",
+    "test:permissions": "node scripts/verify-permission-actions.mjs",
+    "test:skills": "node scripts/verify-skills-ui.mjs"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.0",
     "@types/markdown-it": "^14.1.2",
     "vue-tsc": "^3.0.0",
+    "playwright-core": "^1.62.1",
     "typescript": "^5.9.2",
     "vite": "^7.1.3"
   },

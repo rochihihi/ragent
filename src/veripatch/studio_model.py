@@ -101,7 +101,10 @@ _NATIVE_TOOL_DESCRIPTIONS = {
     "update_plan": "Replace the advisory task plan with your chosen steps and statuses. At most one in_progress. No tools are executed and no permission or verification is granted.",
     "list_files": "List repository files to understand the workspace structure.",
     "search": "Search UTF-8 repository file contents across languages for a literal query; return matching paths, line numbers and text. Use list_files to discover paths and read to inspect relevant files.",
-    "read": "Read one repository file using a workspace-relative path.",
+    "read": (
+        "Read a workspace file using a relative or absolute path. Reading an available skill's "
+        "SKILL.md activates its full workflow guidance; resources are read separately on demand."
+    ),
     "edit": "Replace one exact text occurrence in an existing file.",
     "apply_patch": "Apply an audited unified diff to one or more existing repository files.",
     "create": "Create a new file with complete content.",
@@ -144,6 +147,15 @@ def _native_tools(
             "rationale": {"type": "string"},
             **action_fields,
         }
+        if name in {"run_command", "run_tests", "start_terminal", "write_terminal", "mcp_call"}:
+            properties["execution_mode"] = {
+                "type": "string", "enum": ["sandbox", "host"],
+                "description": (
+                    "Default sandbox. Propose host only for a specific incompatibility or desktop "
+                    "interaction; explain why in rationale. This is not approval: the user must "
+                    "approve this exact host call, and policy may forbid it."
+                ),
+            }
         if name in {"respond", "finish"}:
             claim_schema = StudioClaim.model_json_schema()
             claim_schema["additionalProperties"] = False
@@ -280,6 +292,14 @@ When the user asks to open or launch a workspace file, use run_command instead o
 instructions or claiming that computer control is unavailable. On Windows, launch HTML with
 ["cmd", "/c", "start", "", "index.html"] and Python GUI files with
 ["cmd", "/c", "start", "", "python", "app.py"]; RAgent will request user approval.
+Desktop launches require execution_mode="host" while sandboxing is enabled. This same per-call
+mode can be proposed for run_command, start_terminal, run_tests, or a local stdio mcp_call that
+cannot work inside the sandbox, not only document opening. Explain the specific need and risk.
+Never disable global sandbox settings, automatically retry outside the sandbox, or treat ordinary
+command approval/full access as host authority. A host call always needs fresh user approval;
+the default for other calls remains sandbox. If policy forbids exceptions or the user refuses,
+report the limitation and choose an in-sandbox alternative. Host output has sandboxed=false;
+opening a document only confirms dispatch, not a visible window or successful UI behavior.
 Opening is only one requirement when it appears inside a compound coding task. Preserve the
 user's requested artifact and order. Choose appropriate checks yourself unless strict verification
 is enabled; an already successful launch does not need repeating just because tests ran later.

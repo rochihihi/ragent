@@ -1,0 +1,123 @@
+diff --git a/vendor/srt-win-src/src/acl.rs b/vendor/srt-win-src/src/acl.rs
+index 0efb595..ebb66b9 100644
+--- a/vendor/srt-win-src/src/acl.rs
++++ b/vendor/srt-win-src/src/acl.rs
+@@ -44,7 +44,7 @@ use windows::Win32::Security::{
+     GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+     SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+-    SetSecurityDescriptorDacl, UNPROTECTED_DACL_SECURITY_INFORMATION,
++    SetSecurityDescriptorDacl, SetFileSecurityW, UNPROTECTED_DACL_SECURITY_INFORMATION,
+ };
+ use windows::Win32::Storage::FileSystem::{
+     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+@@ -779,7 +779,10 @@ impl SbAceSet {
+             v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
+         }
+         if self.deny_fdc {
+-            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
++            // Parent deletion protection applies to THIS directory only.
++            // Inheriting it over the user's entire profile is unnecessary:
++            // each denied child already receives its own parent-FDC entry.
++            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), NO_INHERIT));
+         }
+         if let Some(m) = self.grant {
+             v.push(NewAce::Allow(sid, m.bits(), OICI));
+@@ -824,6 +827,40 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
+         read_file_dacl(canonical_path).with_context(|| format!("recompose '{canonical_path}'"))?;
+     let protected =
+         sd_dacl_protected(&sd).with_context(|| format!("recompose '{canonical_path}'"))?;
++    // Preserve inherited entries for the object-only fast path and for the
++    // no-op comparison. Never rederive an unchanged DACL over a large tree.
++    let mut old_inheritable = false;
++    let kept_all = filter_aces(old, |hdr, body| {
++        let explicit_sb = hdr.AceFlags & INHERITED_ACE == 0 && ace_sid_is(body, sid_bytes);
++        if explicit_sb && hdr.AceFlags & OICI.0 as u8 != 0 {
++            old_inheritable = true;
++        }
++        !explicit_sb
++    })?;
++    let head = set.head_aces(sid.as_psid());
++    let unchanged_view = rebuild_acl(kept_all.2, &head, &kept_all, &[])?;
++    if acl_entries_equal(old, unchanged_view.as_ptr())? {
++        return Ok(());
++    }
++    if !old_inheritable && set.grant.is_none() && set.deny.is_none() {
++        // SetNamedSecurityInfoW propagates even non-inheritable edits over
++        // existing children. SetFileSecurityW intentionally changes just the
++        // object. This branch is ONLY for object-only FDC/delete edits; grants
++        // and subtree denies still use normal inheritance propagation below.
++        let mut descriptor = SECURITY_DESCRIPTOR::default();
++        let psd = PSECURITY_DESCRIPTOR(&mut descriptor as *mut _ as *mut c_void);
++        unsafe {
++            InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION)?;
++            SetSecurityDescriptorDacl(psd, true, Some(unchanged_view.as_ptr()), false)?;
++            SetSecurityDescriptorControl(psd, SE_DACL_PROTECTED,
++                if protected { SE_DACL_PROTECTED } else { Default::default() })?;
++            if !SetFileSecurityW(pcwstr(&wstr(canonical_path)), DACL_SECURITY_INFORMATION, psd).as_bool() {
++                return Err(windows::core::Error::from_thread())
++                    .with_context(|| format!("SetFileSecurityW(object-only '{canonical_path}')"));
++            }
++        }
++        return Ok(());
++    }
+     // 2. Collect surviving explicit ACEs (drop inherited and any
+     //    explicit ACE whose SID == sandbox_sid — allow AND deny).
+     let kept = filter_aces(old, |hdr, body| {
+@@ -845,6 +882,26 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
+         .with_context(|| format!("recompose '{canonical_path}'"))
+ }
+ 
++fn acl_entries_equal(left: *const ACL, right: *const ACL) -> Result<bool> {
++    if left.is_null() || right.is_null() { return Ok(left == right); }
++    if unsafe { (*left).AclRevision != (*right).AclRevision || (*left).AceCount != (*right).AceCount } {
++        return Ok(false);
++    }
++    for i in 0..unsafe { (*left).AceCount } as u32 {
++        let mut a: *mut c_void = std::ptr::null_mut();
++        let mut b: *mut c_void = std::ptr::null_mut();
++        unsafe {
++            GetAce(left, i, &mut a)?;
++            GetAce(right, i, &mut b)?;
++            let size_a = (*(a as *const ACE_HEADER)).AceSize as usize;
++            let size_b = (*(b as *const ACE_HEADER)).AceSize as usize;
++            if size_a != size_b || std::slice::from_raw_parts(a as *const u8, size_a)
++                != std::slice::from_raw_parts(b as *const u8, size_b) { return Ok(false); }
++        }
++    }
++    Ok(true)
++}
++
+ /// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
+ /// for `sandbox_sid` covering at least the [`DenyMask::WriteDeny`]
+ /// bits. Drift check for `srt-win status`'s ambient write-deny
+@@ -877,6 +934,29 @@ const INHERITED_ACE: u8 = 0x10;
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn parent_fdc_is_object_only() {
++        let sid = LocalPsid::from_string("S-1-5-21-1-2-3-1004").unwrap();
++        let set = SbAceSet { deny_fdc: true, ..Default::default() };
++        let entries = set.head_aces(sid.as_psid());
++        assert_eq!(entries.len(), 1);
++        assert!(matches!(entries[0], NewAce::Deny(_, _, f) if f == NO_INHERIT));
++        let denied = SbAceSet { deny: Some(DenyMask::ReadDeny), ..Default::default() };
++        assert!(matches!(denied.head_aces(sid.as_psid())[0], NewAce::Deny(_, _, f) if f == OICI));
++    }
++
++    #[test]
++    fn acl_noop_comparison_includes_mask_and_flags() {
++        let sid = "S-1-5-21-1-2-3-1004";
++        let a = build_allow_dacl(&[Allow(sid, Mask::FILE_READ_EXEC, OICI)]).unwrap();
++        let same = build_allow_dacl(&[Allow(sid, Mask::FILE_READ_EXEC, OICI)]).unwrap();
++        let mask = build_allow_dacl(&[Allow(sid, Mask::FILE_ALL, OICI)]).unwrap();
++        let flags = build_allow_dacl(&[Allow(sid, Mask::FILE_READ_EXEC, NO_INHERIT)]).unwrap();
++        assert!(acl_entries_equal(a.as_ptr(), same.as_ptr()).unwrap());
++        assert!(!acl_entries_equal(a.as_ptr(), mask.as_ptr()).unwrap());
++        assert!(!acl_entries_equal(a.as_ptr(), flags.as_ptr()).unwrap());
++    }
++
+     fn ace_count(d: &BuiltAcl) -> u16 {
+         // ACL.AceCount is bytes 4–5 (LE u16).
+         u16::from_le_bytes([d.buf[4], d.buf[5]])

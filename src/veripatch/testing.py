@@ -14,6 +14,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Protocol
 
+from veripatch import studio_sandbox
 from veripatch.domain import TestOutcome
 
 
@@ -96,9 +97,20 @@ def _local_python(root: Path) -> str:
 
 
 class LocalPytestRunner:
-    def __init__(self, root: Path, *, timeout_seconds: int = 120) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        timeout_seconds: int = 120,
+        read_paths: list[Path] | None = None,
+        write_paths: list[Path] | None = None,
+        host_execution_approved: bool = False,
+    ) -> None:
         self.root = root.resolve()
         self.timeout_seconds = timeout_seconds
+        self.read_paths = read_paths
+        self.write_paths = write_paths
+        self.host_execution_approved = host_execution_approved
 
     def run(self, command: list[str]) -> TestOutcome:
         validate_pytest_command(command)
@@ -108,17 +120,15 @@ class LocalPytestRunner:
         started = time.perf_counter()
         console_encoding = locale.getpreferredencoding(False)
         try:
-            completed = subprocess.run(
+            completed = studio_sandbox.run(
+                self.root,
                 command,
-                cwd=self.root,
-                env=_sanitized_environment(),
-                capture_output=True,
-                text=True,
-                encoding=console_encoding,
-                errors="replace",
+                _sanitized_environment(),
                 timeout=self.timeout_seconds,
-                shell=False,
-                check=False,
+                encoding=console_encoding,
+                read_paths=self.read_paths,
+                write_paths=self.write_paths,
+                host_execution_approved=self.host_execution_approved,
             )
             return TestOutcome(
                 command=command,
@@ -126,6 +136,8 @@ class LocalPytestRunner:
                 stdout=completed.stdout[-20_000:],
                 stderr=completed.stderr[-20_000:],
                 duration_seconds=time.perf_counter() - started,
+                sandboxed=getattr(completed, "sandboxed", False),
+                execution_mode="sandbox" if getattr(completed, "sandboxed", False) else "host",
             )
         except subprocess.TimeoutExpired as exc:
             stdout = (
@@ -207,11 +219,17 @@ class InProcessDemoPytestRunner:
         )
 
 
-def studio_pytest_runner(root: Path) -> TestRunner:
+def studio_pytest_runner(
+    root: Path, *, read_paths: list[Path] | None = None, write_paths: list[Path] | None = None,
+    host_execution_approved: bool = False,
+) -> TestRunner:
     """Select a pytest runner that also works inside the frozen desktop app."""
-    if getattr(sys, "frozen", False):
-        return InProcessDemoPytestRunner(root)
-    return LocalPytestRunner(root)
+    # Project tests execute arbitrary code; never run them inside the desktop
+    # interpreter, including frozen builds. Missing Python is an actionable error.
+    return LocalPytestRunner(
+        root, read_paths=read_paths, write_paths=write_paths,
+        host_execution_approved=host_execution_approved,
+    )
 
 
 class DockerPytestRunner:

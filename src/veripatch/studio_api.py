@@ -14,13 +14,13 @@ from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field
-
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field, model_validator
 
 from veripatch.config import Settings
 from veripatch.studio_agent import StudioAgent, _file_tree, context_limit_for_model
@@ -30,19 +30,20 @@ from veripatch.studio_domain import (
     StudioAction,
     StudioDecision,
     StudioMessage,
-
     StudioSession,
     VerificationMode,
 )
-
 from veripatch.studio_git import GitToolError, StudioGit
 from veripatch.studio_model import StudioProviderModel
 from veripatch.studio_store import StudioStore
 from veripatch.studio_tools import (
     TERMINALS as TERMINALS,  # Compatibility export; execution lives in the Agent.
+)
+from veripatch.studio_tools import (
     SafeStudioCommandRunner as SafeStudioCommandRunner,  # Compatibility export.
+)
+from veripatch.studio_tools import (
     UnsafeStudioCommand,
-
     detect_project,
     validate_studio_command,
 )
@@ -61,12 +62,55 @@ class CreateStudioSession(BaseModel):
     test_command: list[str] | str = Field(default_factory=list)
 
 
+class SkillPackageFile(BaseModel):
+    path: str = Field(min_length=1, max_length=240)
+    data: str = Field(max_length=2_800_000)
+
+
 class SkillImport(BaseModel):
+    content: str | None = Field(default=None, min_length=1, max_length=12000)
+    files: list[SkillPackageFile] | None = Field(default=None, max_length=200)
+    archive: str | None = Field(default=None, max_length=11_200_000)
+    replace: bool = False
+    expected_version: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        if sum(value is not None for value in (self.content, self.files, self.archive)) != 1:
+            raise ValueError("请选择一种技能导入来源")
+        if self.files and sum(len(f.data) for f in self.files) > 11_200_000:
+            raise ValueError("技能包超过 8 MiB")
+        return self
+
+
+class SkillEdit(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
+    expected_version: str = Field(min_length=64, max_length=64)
 
 
 class SkillSelection(BaseModel):
-    names: list[str] = Field(max_length=10)
+    names: list[str] | None = Field(default=None, max_length=10)
+    modes: dict[str, Literal["auto", "pinned", "disabled"]] | None = None
+
+
+class _SkillBodyLimitedRoute(APIRoute):
+    """Bound streamed package JSON before FastAPI decodes Base64 or validates models."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def bounded(request: Request):
+            if "/skills" in request.url.path and request.method in {"POST", "PUT", "PATCH"}:
+                chunks, length = [], 0
+                async for chunk in request.stream():
+                    length += len(chunk)
+                    if length > 16 * 1024 * 1024:
+                        return JSONResponse({"detail": "技能请求超过 16 MiB"}, status_code=413)
+                    chunks.append(chunk)
+                request._body = b"".join(chunks)
+            return await handler(request)
+
+        return bounded
 
 
 class StudioUserMessage(BaseModel):
@@ -315,10 +359,10 @@ def _restore_before_from_unified_diff(current: str, patch: str, path: str) -> st
     return "".join(restored)
 
 
-def create_studio_router(settings: Settings) -> APIRouter:
+def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> APIRouter:
     from veripatch import studio_skills
 
-    router = APIRouter()
+    router = APIRouter(route_class=_SkillBodyLimitedRoute)
     store = StudioStore(settings.database_path)
     tasks: dict[str, asyncio.Task[None]] = {}
     steer_queues: dict[str, deque[str]] = {}
@@ -383,11 +427,48 @@ def create_studio_router(settings: Settings) -> APIRouter:
     def list_skills(session_id: str):
         session = load_session(session_id)
         try:
+            listing = studio_skills.listing(session.repo_root)
             return {
-                "items": studio_skills.discover(session.repo_root),
+                **listing,
                 "enabled": session.enabled_skills,
+                "modes": {
+                    item["name"]: studio_skills.mode_for(session, item["name"])
+                    for item in listing["items"]
+                },
+                "active": list(session.active_skill_contents),
+                "locked": session.status in {"running", "waiting_permission"},
             }
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    def skill_package(request: SkillImport):
+        return studio_skills.decode_package(
+            content=request.content, archive=request.archive,
+            files=[f.model_dump() for f in request.files] if request.files is not None else None,
+        )
+
+    @router.post("/studio-api/sessions/{session_id}/skills/preview")
+    def preview_skill(session_id: str, request: SkillImport):
+        session = load_session(session_id)
+        try:
+            return studio_skills.preview(session.repo_root, skill_package(request))
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.get("/studio-api/sessions/{session_id}/skills/{name}")
+    def skill_detail(session_id: str, name: str):
+        session = load_session(session_id)
+        try:
+            return studio_skills.detail(session.repo_root, name)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.get("/studio-api/sessions/{session_id}/skills/{name}/resource")
+    def skill_resource(session_id: str, name: str, path: str = Query(max_length=240)):
+        session = load_session(session_id)
+        try:
+            return studio_skills.resource(session.repo_root, name, path)
+        except (ValueError, OSError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
     @router.post("/studio-api/sessions/{session_id}/skills", status_code=201)
@@ -396,9 +477,74 @@ def create_studio_router(settings: Settings) -> APIRouter:
         if session.status in {"running", "waiting_permission"}:
             raise HTTPException(409, "请等待任务结束后管理技能")
         try:
-            return studio_skills.install(session.repo_root, request.content)
+            result = studio_skills.install_package(
+                session.repo_root, skill_package(request), replace=request.replace,
+                expected_version=request.expected_version,
+            )
+            session.skill_modes.setdefault(result["name"], "auto")
+            session.active_skill_contents.pop(result["name"], None)
+            store.save(session, "skill_imported", {"name": result["name"],
+                       "backup": result["backup"], "summary": f"已导入技能 {result['name']}。"})
+            return result
         except FileExistsError as exc:
             raise HTTPException(409, "同名技能已存在，不会覆盖") from exc
+        except studio_skills.SkillConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/studio-api/sessions/{session_id}/skills/{name}/repair")
+    def repair_skill_permissions(
+        session_id: str, name: str, version: str = Query(min_length=64, max_length=64)
+    ):
+        session = load_session(session_id)
+        if session.status in {"running", "waiting_permission"}:
+            raise HTTPException(409, "请等待任务结束后管理技能")
+        try:
+            result = studio_skills.repair_permissions(session.repo_root, name, version)
+            session.active_skill_contents.pop(name, None)
+            store.save(session, "skill_permissions_repaired", {
+                "name": name, "backup": result["backup"],
+                "summary": f"技能 {name} 已按项目权限重新保存，原包已备份。",
+            })
+            return result
+        except studio_skills.SkillConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.patch("/studio-api/sessions/{session_id}/skills/{name}")
+    def edit_skill(session_id: str, name: str, request: SkillEdit):
+        session = load_session(session_id)
+        if session.status in {"running", "waiting_permission"}:
+            raise HTTPException(409, "请等待任务结束后管理技能")
+        try:
+            result = studio_skills.edit(
+                session.repo_root, name, request.content, request.expected_version,
+            )
+            session.active_skill_contents.pop(name, None)
+            store.save(session, "skill_updated", {"name": name, "backup": result["backup"],
+                       "summary": f"已更新技能 {name}，原版本已备份。"})
+            return result
+        except studio_skills.SkillConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.delete("/studio-api/sessions/{session_id}/skills/{name}")
+    def delete_skill(session_id: str, name: str, version: str = Query(min_length=64, max_length=64)):
+        session = load_session(session_id)
+        if session.status in {"running", "waiting_permission"}:
+            raise HTTPException(409, "请等待任务结束后管理技能")
+        try:
+            result = studio_skills.remove(session.repo_root, name, version)
+            session.skill_modes.pop(name, None)
+            session.enabled_skills = [n for n in session.enabled_skills if n != name]
+            session.active_skill_contents.pop(name, None)
+            store.save(session, "skill_deleted", {**result, "summary": f"已移除技能 {name}，文件已备份。"})
+            return result
+        except studio_skills.SkillConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
         except (ValueError, OSError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -408,12 +554,27 @@ def create_studio_router(settings: Settings) -> APIRouter:
         if session.status in {"running", "waiting_permission"}:
             raise HTTPException(409, "请等待任务结束后管理技能")
         try:
-            studio_skills.selected(session.repo_root, request.names)
+            if request.modes is None and request.names is None:
+                raise ValueError("需要提供模式或启用项")
+            if request.modes is not None:
+                available = {i["name"] for i in studio_skills.listing(session.repo_root)["items"]}
+                if len(request.modes) > 200 or not set(request.modes).issubset(available):
+                    raise ValueError("技能模式包含不存在的技能或超过 200 项")
+                modes = {n: request.modes.get(n, "disabled") for n in available}
+                names = [n for n, mode in modes.items() if mode == "pinned"]
+            else:
+                names = list(dict.fromkeys(request.names or []))
+                modes = {n: "pinned" for n in names}
+            if len(names) > 10:
+                raise ValueError("最多固定启用 10 项技能")
+            studio_skills.selected(session.repo_root, names)
         except (ValueError, OSError) as exc:
             raise HTTPException(400, str(exc)) from exc
-        session.enabled_skills = list(dict.fromkeys(request.names))
+        session.enabled_skills = names
+        session.skill_modes = modes
+        session.active_skill_contents = {}
         store.save(session, "skills_updated", {"names": session.enabled_skills})
-        return {"enabled": session.enabled_skills}
+        return {"enabled": session.enabled_skills, "modes": session.skill_modes}
 
     @router.get("/studio", response_class=HTMLResponse)
     async def studio_page() -> str:
@@ -799,7 +960,7 @@ def create_studio_router(settings: Settings) -> APIRouter:
 
     @router.post("/studio-api/sessions/{session_id}/permissions/{request_id}")
     async def decide_permission(
-        session_id: str, request_id: str, request: PermissionDecision
+        session_id: str, request_id: str, request: PermissionDecision, http_request: Request,
     ) -> dict[str, str]:
         session = load_session(session_id)
         pending = session.pending_permission
@@ -840,9 +1001,38 @@ def create_studio_router(settings: Settings) -> APIRouter:
             return {"status": "revising"}
         if request.approved:
             if pending.decision is not None:
-                from veripatch.studio_permissions import fingerprint, session_rule
+                from veripatch.studio_permissions import (
+                    fingerprint,
+                    session_rule,
+                    uses_host_execution,
+                )
 
                 decision = StudioDecision.model_validate(pending.decision)
+                if uses_host_execution(decision):
+                    from veripatch.sandbox_management import require_desktop_approval
+
+                    require_desktop_approval(
+                        ui_token, http_request.headers.get("x-veripatch-ui"),
+                        http_request.headers.get("x-ragent-sandbox-key"),
+                    )
+                if pending.approval_digest is not None:
+                    import hashlib
+
+                    try:
+                        digest = hashlib.sha256(fingerprint(decision).encode()).hexdigest()
+                    except (ValueError, OSError, RuntimeError):
+                        raise HTTPException(
+                            status_code=409, detail="执行配置已失效，请重新生成审批"
+                        ) from None
+                    if pending.approval_digest != digest:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="执行策略或 MCP 配置已变化，请拒绝或调整后重新审批",
+                        )
+                if request.scope == "session" and uses_host_execution(decision):
+                    raise HTTPException(
+                        status_code=400, detail="沙箱外执行仅允许本次批准，不可保存会话授权"
+                    )
                 action_name = decision.action.value
                 if (
                     session.task_contract is not None

@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/anthropics/sandbox-runtime",
+  "upstream_commit": "6f0ce155ccb136bda33a8a72201fe7f54fe47d9b",
+  "upstream_tag": "v0.0.78",
+  "patch": "ragent-windows-acl-v1",
+  "patch_sha256": "d59fcc5dd0870f68693884bba9e393551d9fd989be8ba9805878f26a3ce23e11",
+  "sha256": "96cd6d2f1922070feb5e0c005698e580c21993d349908f9716456ed3c9d13259",
+  "target": "x86_64-pc-windows-gnu",
+  "rust": "1.90.0"
+}

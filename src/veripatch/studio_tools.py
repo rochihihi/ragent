@@ -14,6 +14,7 @@ from queue import Empty, Queue
 from typing import TextIO, TypedDict
 from uuid import uuid4
 
+from veripatch import studio_sandbox
 from veripatch.domain import TestOutcome
 from veripatch.testing import _sanitized_environment
 
@@ -28,7 +29,9 @@ def resolve_studio_executable(name: str) -> str | None:
     if discovered:
         return discovered
     if name.casefold() in {"go", "go.exe"}:
-        installed = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Go" / "bin" / "go.exe"
+        installed = (
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Go" / "bin" / "go.exe"
+        )
         if installed.is_file():
             return str(installed)
     return None
@@ -45,17 +48,44 @@ class CommandPermissionDetails(TypedDict):
 
 
 def command_permission_details(
-    command: list[str], rationale: str | None = None
+    command: list[str], rationale: str | None = None, *, execution_mode: str = "sandbox"
 ) -> CommandPermissionDetails:
     """Display the proposed reason, never infer side effects from command text."""
+    if execution_mode == "host":
+        return {
+            "purpose": f"申请本次沙箱外执行。模型理由（未独立核实）：{rationale or '未提供'}",
+            "impact": (
+                "本次以当前用户权限在沙箱外执行，可启动桌面窗口、读写工作区外文件和联网。"
+                "这不是安全判定；不会关闭其他调用的沙箱，也不授予管理员权限。"
+            ),
+            "scope": "仅下方这次完整命令及其子进程；工作目录不是访问边界，不记为会话授权。",
+            "recovery": "副作用未确认；启动的程序可能继续运行，关闭窗口不会撤销文件或网络操作。",
+            "recommendation": "确认确实需要桌面交互或无法使用隔离方案后再批准；不确定时拒绝。",
+            "risk": "high", "destructive": False,
+        }
     return {
         "purpose": f"模型提供的执行理由（未独立核实）：{rationale.strip()}"
         if rationale and rationale.strip()
         else "模型未提供执行理由；请核对下方完整命令。",
-        "impact": "该命令将以当前用户权限执行；没有进程沙箱，可能读写文件、访问网络或启动程序。",
-        "scope": "授权对象是显示的完整命令；工作目录不是文件访问边界，实际影响范围未确认。",
+        "impact": (
+            "已要求操作系统沙箱；审批不会绕过沙箱，不可用时拒绝执行。仍可能修改授权工作区。"
+            if studio_sandbox.settings().mode == "required"
+            else (
+                "用户已关闭沙箱：该命令以当前用户权限执行，没有进程沙箱，"
+                "可能读写文件、访问网络或启动程序。"
+            )
+        ),
+        "scope": (
+            "授权对象是显示的完整命令；沙箱写入范围为工作区及已批准写路径，"
+            "网络遵循设置中的域名白名单。"
+        )
+        if studio_sandbox.settings().mode == "required"
+        else "工作目录不是文件访问边界，实际影响范围未确认。",
         "recovery": "未确认副作用及其可恢复性；执行前请确认目标并保留必要备份。",
-        "recommendation": "请结合完整命令、工作目录和执行理由决定；不确定时拒绝并要求说明或缩小范围。",
+        "recommendation": (
+            "请结合完整命令、工作目录和执行理由决定；"
+            "不确定时拒绝并要求说明或缩小范围。"
+        ),
         "risk": "unknown",
         "destructive": False,  # Compatibility field, not a finding of non-destructiveness.
     }
@@ -156,10 +186,13 @@ def validate_studio_command(command: list[str]) -> None:
 
 
 class ManagedTerminal:
-    def __init__(self, terminal_id: str, root: Path, process: subprocess.Popen[str]) -> None:
+    def __init__(
+        self, terminal_id: str, root: Path, process: subprocess.Popen[str], sandboxed: bool = False
+    ) -> None:
         self.terminal_id = terminal_id
         self.root = root
         self.process = process
+        self.sandboxed = sandboxed
         self.output: Queue[str] = Queue()
         self.history = ""
         self.window_confirmed = False
@@ -187,6 +220,8 @@ class ManagedTerminal:
             "running": exit_code is None,
             "exit_code": exit_code,
             "output": text[-20_000:],
+            "sandboxed": self.sandboxed,
+            "execution_mode": "sandbox" if self.sandboxed else "host",
         }
 
 
@@ -205,6 +240,9 @@ class TerminalRegistry:
         approved_commands: list[list[str]] | None = None,
         approved_capabilities: list[str] | None = None,
         expect_window: bool = False,
+        read_paths: list[Path] | None = None,
+        write_paths: list[Path] | None = None,
+        host_execution_approved: bool = False,
     ) -> dict[str, object]:
         runner = SafeStudioCommandRunner(
             root,
@@ -220,21 +258,47 @@ class TerminalRegistry:
             resolved[0] = executable
         environment = _sanitized_environment()
         environment.update({"NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"})
-        process = subprocess.Popen(
+        launch = studio_sandbox.prepare(
+            root,
             resolved,
-            cwd=root.resolve(),
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding=locale.getpreferredencoding(False),
-            errors="replace",
-            shell=False,
-            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
+            environment,
+            read_paths=read_paths,
+            write_paths=write_paths,
+            interactive=True,
+            host_execution_approved=host_execution_approved,
         )
+        try:
+            process = subprocess.Popen(
+                launch.argv,
+                cwd=studio_sandbox.runtime_root() if launch.enabled else root.resolve(),
+                env=launch.env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding=locale.getpreferredencoding(False),
+                errors="replace",
+                shell=False,
+                start_new_session=os.name != "nt",
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                ),
+            )
+        except BaseException:
+            launch.close()
+            raise
+        if launch.enabled:
+            try:
+                launch.wait_ready(process)
+            except BaseException:
+                studio_sandbox.stop_process_tree(process)
+                launch.close()
+                raise
+            launch.follow(process)
+        else:
+            launch.close()
         terminal_id = uuid4().hex[:12]
-        terminal = ManagedTerminal(terminal_id, root.resolve(), process)
+        terminal = ManagedTerminal(terminal_id, root.resolve(), process, launch.enabled)
         terminal.launch_tracked = expect_window
         with self._lock:
             self._sessions[terminal_id] = terminal
@@ -244,6 +308,8 @@ class TerminalRegistry:
             "running": process.poll() is None,
             "output": "",
             "window_confirmed": None,
+            "sandboxed": launch.enabled,
+            "execution_mode": "sandbox" if launch.enabled else "host",
         }
 
     def _get(self, root: Path, terminal_id: str) -> ManagedTerminal:
@@ -254,7 +320,9 @@ class TerminalRegistry:
         return terminal
 
     def register_launch(
-        self, root: Path, process: subprocess.Popen[str],
+        self,
+        root: Path,
+        process: subprocess.Popen[str],
     ) -> str:
         terminal_id = uuid4().hex[:12]
         terminal = ManagedTerminal(terminal_id, root.resolve(), process)
@@ -267,35 +335,51 @@ class TerminalRegistry:
         terminal = self._get(root, terminal_id)
         observed = terminal.poll()
         observed["output"] = terminal.history[-20_000:]
-        observed.update({
-            "pid": terminal.process.pid,
-            "window_confirmed": None,
-            "launch_state": (
-                "running_unconfirmed" if observed["running"] else "exited_unconfirmed"
-            ),
-        })
+        observed.update(
+            {
+                "pid": terminal.process.pid,
+                "window_confirmed": None,
+                "launch_state": (
+                    "running_unconfirmed" if observed["running"] else "exited_unconfirmed"
+                ),
+            }
+        )
         return observed
 
     def poll(self, root: Path, terminal_id: str) -> dict[str, object]:
         terminal = self._get(root, terminal_id)
-        return self.inspect_launch(root, terminal_id) if terminal.launch_tracked else terminal.poll()
+        return (
+            self.inspect_launch(root, terminal_id) if terminal.launch_tracked else terminal.poll()
+        )
 
-    def write(self, root: Path, terminal_id: str, content: str) -> dict[str, object]:
+    def is_sandboxed(self, root: Path, terminal_id: str) -> bool:
+        return self._get(root, terminal_id).sandboxed
+
+    def write(
+        self, root: Path, terminal_id: str, content: str, *,
+        host_execution_approved: bool = False,
+    ) -> dict[str, object]:
         terminal = self._get(root, terminal_id)
+        if not terminal.sandboxed and studio_sandbox.settings().mode == "required":
+            if not host_execution_approved:
+                raise UnsafeStudioCommand("Writing to a host terminal requires fresh host approval")
+            studio_sandbox.ensure_host_execution_allowed()
         if terminal.process.poll() is not None or terminal.process.stdin is None:
             raise ValueError(f"Terminal session has exited: {terminal_id}")
         terminal.process.stdin.write(content)
         terminal.process.stdin.flush()
-        return {"terminal_id": terminal_id, "written": len(content), "running": True}
+        return {
+            "terminal_id": terminal_id, "written": len(content), "running": True,
+            "sandboxed": terminal.sandboxed,
+            "execution_mode": "sandbox" if terminal.sandboxed else "host",
+        }
 
     def stop(self, root: Path, terminal_id: str) -> dict[str, object]:
         terminal = self._get(root, terminal_id)
         if terminal.process.poll() is None:
-            terminal.process.terminate()
-            try:
-                terminal.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                terminal.process.kill()
+            # Both the sandbox broker and an approved host shell can own child
+            # processes. Stop the known tree, not just its short-lived wrapper.
+            studio_sandbox.stop_process_tree(terminal.process)
         result = terminal.poll()
         result["stopped"] = True
         return result
@@ -343,11 +427,17 @@ class SafeStudioCommandRunner:
         timeout_seconds: int = 180,
         approved_commands: list[list[str]] | None = None,
         approved_capabilities: list[str] | None = None,
+        read_paths: list[Path] | None = None,
+        write_paths: list[Path] | None = None,
+        host_execution_approved: bool = False,
     ) -> None:
         self.root = root.resolve()
         self.timeout_seconds = timeout_seconds
         self.approved_commands = approved_commands or []
         self.approved_capabilities = approved_capabilities or []
+        self.read_paths = read_paths
+        self.write_paths = write_paths
+        self.host_execution_approved = host_execution_approved
 
     def _is_approved(self, command: list[str]) -> bool:
         capability = command_capability(command, self.root)
@@ -377,20 +467,15 @@ class SafeStudioCommandRunner:
         environment = _sanitized_environment()
         environment.update({"CI": "1", "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"})
         try:
-            completed = subprocess.run(
+            completed = studio_sandbox.run(
+                self.root,
                 resolved,
-                cwd=self.root,
-                env=environment,
-                capture_output=True,
-                text=True,
-                encoding=encoding,
-                errors="replace",
+                environment,
                 timeout=self.timeout_seconds,
-                shell=False,
-                check=False,
-                creationflags=(
-                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-                ),
+                encoding=encoding,
+                read_paths=self.read_paths,
+                write_paths=self.write_paths,
+                host_execution_approved=self.host_execution_approved,
             )
             return TestOutcome(
                 command=command,
@@ -398,6 +483,8 @@ class SafeStudioCommandRunner:
                 stdout=completed.stdout[-20_000:],
                 stderr=completed.stderr[-20_000:],
                 duration_seconds=time.perf_counter() - started,
+                sandboxed=getattr(completed, "sandboxed", False),
+                execution_mode="sandbox" if getattr(completed, "sandboxed", False) else "host",
             )
         except subprocess.TimeoutExpired as exc:
             return TestOutcome(
@@ -414,6 +501,13 @@ class SafeStudioCommandRunner:
         validate_studio_command(command)
         if not self._is_approved(command):
             raise UnsafeStudioCommand("Launching a GUI command requires explicit approval")
+        if self.host_execution_approved:
+            studio_sandbox.ensure_host_execution_allowed()
+        elif studio_sandbox.settings().mode == "required":
+            raise studio_sandbox.SandboxError(
+                "SandboxDesktopError: 桌面 GUI 启动需要本次沙箱外执行；"
+                "可提出 execution_mode=host 并说明理由，等待独立批准；不得关闭全局沙箱。"
+            )
         if not is_detached_launch(command):
             raise UnsafeStudioCommand("Command is not a recognized detached launch")
         # An associated document is opened by Windows, often in an existing
@@ -424,7 +518,14 @@ class SafeStudioCommandRunner:
             if arguments and arguments[0] == "":
                 arguments = arguments[1:]
             if len(arguments) == 1 and Path(arguments[0]).suffix.casefold() in {
-                ".html", ".htm", ".pdf", ".png", ".jpg", ".jpeg", ".svg", ".txt",
+                ".html",
+                ".htm",
+                ".pdf",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".svg",
+                ".txt",
             }:
                 target = (self.root / arguments[0]).resolve()
                 if not target.is_relative_to(self.root) or not target.is_file():
@@ -439,6 +540,7 @@ class SafeStudioCommandRunner:
                     duration_seconds=time.perf_counter() - started,
                     launch_state="dispatched",
                     window_confirmed=None,
+                    execution_mode="host",
                 )
         resolved = list(command)
         # `cmd /c start` exits before its child has created a window. For a
@@ -450,7 +552,8 @@ class SafeStudioCommandRunner:
                 child = child[1:]
             if (
                 len(child) >= 2
-                and Path(child[0]).name.casefold() in {"python", "python.exe", "pythonw", "pythonw.exe"}
+                and Path(child[0]).name.casefold()
+                in {"python", "python.exe", "pythonw", "pythonw.exe"}
                 and child[-1].casefold().endswith(".py")
             ):
                 resolved = child
@@ -480,9 +583,11 @@ class SafeStudioCommandRunner:
             shell=False,
             close_fds=True,
             creationflags=creationflags,
+            start_new_session=os.name != "nt",
         )
         terminal_id = TERMINALS.register_launch(
-            self.root, process,
+            self.root,
+            process,
         )
         # A running process is not proof of a visible window. Keep its handle
         # so an uncertain launch can be inspected instead of started again.
@@ -501,6 +606,7 @@ class SafeStudioCommandRunner:
             pid=process.pid,
             launch_state=launch_state,
             window_confirmed=None,
+            execution_mode="host",
         )
 
 

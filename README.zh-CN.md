@@ -14,6 +14,7 @@
 
 - **模型驱动**：只保留 Studio 一套运行流程。模型理解原始请求并选择工具、计划、验证和回答；计划不授予权限。
 - **桌面工作台**：持久化对话、项目树、文件创建、Diff、Git、技能、执行记录与单次上下文占用。
+- **完整技能包**：文件夹/ZIP 导入并保留脚本和资料，安全解析 YAML，支持按会话自动选择、固定启用、禁用、`$名称` 调用及三级加载。更新、删除和旧版 Windows 权限修复均保留备份。详见[技能指南](docs/skills.md)。
 - **受控执行**：具体命令/参数展示、单次和匹配范围的会话授权、原生工作区路径校验及项目元数据保护。
 - **暂停恢复**：默认无固定决策步数上限。可取消待完成的模型请求；同步工具执行完并保存结果后暂停。恢复时不盲目重跑结果不明的调用。
 - **验证反馈**：模型选择相关检查，必要时编写测试；失败作为工具证据反馈。默认模式不强制“测试后再打开”，Strict 增加完成门禁。“完成”不等于测试通过或已目视验证 GUI。
@@ -45,6 +46,7 @@ cd RAgent
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev,desktop]"
 npm --prefix frontend ci
+npm --prefix sandbox/runtime ci --ignore-scripts --registry=https://registry.npmjs.org
 npm --prefix frontend run build
 .\.venv\Scripts\ragent-desktop.exe
 ```
@@ -54,6 +56,8 @@ npm --prefix frontend run build
 旧 `ragent` / `veripatch` 命令行功能（包括 `serve`、`auth`、`quota`）已移除。桌面启动入口保留；凭据和余额在界面管理，余额查询能力取决于服务商/中转站。
 
 ## 构建 Windows EXE
+
+可直接从 [GitHub Releases](https://github.com/rochihihi/RAgent/releases/latest) 下载 Windows 程序。使用时仍需 WebView2、模型服务配置和实验性 Windows 沙箱初始化；Python 技能脚本需要外部 Python 解释器。
 
 安装上述依赖后：
 
@@ -69,23 +73,27 @@ npm --prefix frontend run build
 
 只启用可信服务：外部工具可能运行程序、修改数据或联网，不受原生文件工具边界完整约束。审批不是第三方服务的沙箱。
 
+命令、测试、Git 子进程和本地 stdio MCP 已接入默认要求开启的实验性操作系统沙箱。请在“设置 → 执行沙箱”检查/安装 Windows alpha 后端；不会自动提权或无隔离重跑。远程 HTTP MCP 的副作用不在本机隔离范围内。详见[沙箱使用和限制](docs/SANDBOX.md)。
+
 详见[外部 MCP 配置](docs/EXTERNAL_MCP.md)。当前没有 OAuth 流程、旧 HTTP SSE 传输或持久连接复用。
 
 ## 开发验证
 
 ```powershell
+.\.venv\Scripts\python.exe -m pytest
 npm --prefix frontend run check:vue
+npm --prefix frontend run test:trace
 npm --prefix frontend run build
 ```
 
-本次源码发布仅包含运行时、Vue 界面、打包脚本和必要资源，不上传本地回归测试、生成的 EXE 或备份。界面的验收功能保留，直接检查生产代码，不调用模型。
+测试覆盖模型决策、调用身份、权限、暂停恢复、上下文摘要、文件冲突/回滚、持久化和外部 MCP。测试通过只验证覆盖场景，不代表验证了所有服务商或桌面环境。
 
 ## 目录和技术栈
 
 ```text
 src/veripatch/   Studio 运行时、适配器、工具、API 和持久化
 frontend/vue/   Vue 3 桌面界面
-frontend/src/   共享 API 类型、工具函数和样式
+tests/          单元和集成测试
 scripts/        桌面打包脚本
 assets/         桌面资源与截图
 examples/       示例项目
@@ -97,6 +105,8 @@ Python、Pydantic、FastAPI/Uvicorn、SQLite、Vue 3/TypeScript/Vite、PyWebView
 ## 安全边界
 
 本地 API 保持回环监听，不作为公网执行服务。原生文件工具保护路径和元数据，但获准命令和外部工具可能产生更广影响。审批前检查破坏性操作，重要项目使用 Git/备份。
+
+“完全授权”不会关闭沙箱。桌面 GUI 和其他隔离不兼容操作可申请本次沙箱外执行，需独立批准，不复用会话授权，其他默认调用仍隔离；设置可禁止此类例外。沙箱外调用拥有当前用户权限，不代表隔离安全。Windows SRT 为 alpha，并非生产级强安全保证。
 
 凭据与模型上下文分开处理，但文件和工具输出仍可能包含敏感信息，请检查暴露给服务商和外部服务的内容。
 

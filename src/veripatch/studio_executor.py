@@ -6,15 +6,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from veripatch.domain import FileEdit
-from veripatch.studio_domain import StudioAction, StudioDecision, StudioObservation, StudioSession
-from veripatch.mcp_client import call_project_tool
-from veripatch.studio_tools import SafeStudioCommandRunner
-from veripatch.studio_git import StudioGit
-from veripatch.studio_execution import changed_launch_target
-from veripatch.domain import TestOutcome
-from veripatch.studio_tools import TERMINALS, inspect_visible_processes
 from veripatch import studio_completion as completion
+from veripatch import studio_sandbox
+from veripatch.domain import FileEdit, TestOutcome
+from veripatch.mcp_client import call_project_tool
+from veripatch.studio_domain import StudioAction, StudioDecision, StudioObservation, StudioSession
+from veripatch.studio_execution import changed_launch_target
+from veripatch.studio_git import StudioGit
+from veripatch.studio_tools import TERMINALS, SafeStudioCommandRunner, inspect_visible_processes
 from veripatch.workspace import SafeWorkspace
 
 
@@ -67,7 +66,18 @@ class StudioActionExecutor:
                      "diff": workspace.diff()},
         ), failure
 
-    def read(self, workspace: SafeWorkspace, decision: StudioDecision) -> StudioObservation | None:
+    @staticmethod
+    def _host_approved(decision: StudioDecision, action_approved: bool) -> bool:
+        if decision.execution_mode != "host":
+            return False
+        if not action_approved:
+            raise ValueError("沙箱外执行缺少本次独立审批，普通命令授权不能替代")
+        studio_sandbox.ensure_host_execution_allowed()
+        return True
+
+    def read(
+        self, workspace: SafeWorkspace, decision: StudioDecision, *, action_approved: bool = False,
+    ) -> StudioObservation | None:
         if decision.action is StudioAction.LIST_FILES:
             files = self.file_tree(workspace.root)
             return StudioObservation(
@@ -89,8 +99,11 @@ class StudioActionExecutor:
             )
         if decision.action is StudioAction.MCP_CALL:
             assert decision.mcp_tool is not None
+            host_approved = self._host_approved(decision, action_approved)
             result = call_project_tool(
-                workspace.root, decision.mcp_tool, decision.mcp_arguments
+                workspace.root, decision.mcp_tool, decision.mcp_arguments,
+                read_paths=workspace.approved_roots, write_paths=workspace.approved_write_roots,
+                **({"host_execution_approved": True} if host_approved else {}),
             )
             return StudioObservation(
                 kind="mcp_tool", summary=f"MCP 工具 {decision.mcp_tool} 已调用。",
@@ -98,6 +111,10 @@ class StudioActionExecutor:
                     "tool": decision.mcp_tool,
                     "arguments": decision.mcp_arguments,
                     "result": result,
+                    "execution_mode": decision.execution_mode,
+                    "local_execution_boundary": (
+                        "host_exception" if host_approved else "default_policy"
+                    ),
                 },
             )
         return None
@@ -115,7 +132,9 @@ class StudioActionExecutor:
             path = workspace.resolve(decision.path)
             before = path.read_text(encoding="utf-8")
             changed = workspace.apply_edits(
-                [FileEdit(path=decision.path, old_text=decision.old_text, new_text=decision.new_text)],
+                [FileEdit(
+                    path=decision.path, old_text=decision.old_text, new_text=decision.new_text,
+                )],
                 protect_tests=False,
             )
             self.record_changed_paths(session, changed)
@@ -194,6 +213,7 @@ class StudioActionExecutor:
     ) -> StudioObservation | None:
         """Execute verification and command actions outside the orchestrator."""
         if decision.action is StudioAction.RUN_TESTS:
+            host_approved = self._host_approved(decision, action_approved)
             command = (
                 session.test_command
                 if session.verification_mode.value == "strict"
@@ -202,6 +222,8 @@ class StudioActionExecutor:
             outcome = self.run_verification(
                 workspace.root,
                 command,
+                read_paths=workspace.approved_roots, write_paths=workspace.approved_write_roots,
+                **({"host_execution_approved": True} if host_approved else {}),
                 approved_commands=(
                     [command]
                     if action_approved or session.permission_mode.value == "full"
@@ -219,11 +241,14 @@ class StudioActionExecutor:
             return None
         if execution is None:
             raise ValueError("命令尚未完成语义分类")
+        host_approved = self._host_approved(decision, action_approved)
         before = completion.snapshot(workspace.root, artifacts=False)
         runner = SafeStudioCommandRunner(
             workspace.root,
             approved_commands=command_grants,
             approved_capabilities=approved_capabilities,
+            read_paths=workspace.approved_roots, write_paths=workspace.approved_write_roots,
+            host_execution_approved=host_approved,
         )
         outcome = (
             runner.launch(decision.command)
@@ -290,7 +315,10 @@ class StudioActionExecutor:
                 summary=(
                     f"已创建并切换到分支 {payload['created']}。"
                     if payload["created"]
-                    else f"当前分支 {payload['current']}，共 {len(payload['branches'])} 个本地分支。"
+                    else (
+                        f"当前分支 {payload['current']}，"
+                        f"共 {len(payload['branches'])} 个本地分支。"
+                    )
                 ),
                 payload=payload,
             )
@@ -318,10 +346,12 @@ class StudioActionExecutor:
         workspace: SafeWorkspace,
         decision: StudioDecision,
         command_grants: list[list[str]],
+        action_approved: bool = False,
     ) -> StudioObservation | None:
         """Execute terminal lifecycle and live-process inspection actions."""
         action = decision.action
         if action is StudioAction.START_TERMINAL:
+            host_approved = self._host_approved(decision, action_approved)
             launch_target = changed_launch_target(
                 workspace.root, session.turn_changed_files, decision.command
             )
@@ -339,6 +369,8 @@ class StudioActionExecutor:
                 approved_commands=command_grants,
                 approved_capabilities=session.approved_capabilities,
                 expect_window=expect_window,
+                read_paths=workspace.approved_roots, write_paths=workspace.approved_write_roots,
+                **({"host_execution_approved": True} if host_approved else {}),
             )
             payload["command"] = decision.command
             payload["launch_target"] = launch_target
@@ -368,7 +400,11 @@ class StudioActionExecutor:
             )
         if action is StudioAction.WRITE_TERMINAL:
             assert decision.terminal_id is not None and decision.input is not None
-            payload = TERMINALS.write(workspace.root, decision.terminal_id, decision.input)
+            host_approved = self._host_approved(decision, action_approved)
+            payload = TERMINALS.write(
+                workspace.root, decision.terminal_id, decision.input,
+                host_execution_approved=host_approved,
+            )
             return StudioObservation(
                 kind="terminal",
                 summary=f"已向终端 {decision.terminal_id} 发送输入。",

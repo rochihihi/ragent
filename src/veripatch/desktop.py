@@ -6,8 +6,8 @@ import os
 import socket
 import sqlite3
 import sys
-import threading
 import tempfile
+import threading
 import time
 import urllib.request
 from ctypes import Structure, byref, sizeof, windll
@@ -23,13 +23,18 @@ from veripatch.config import Settings
 class WindowControls:
     """Small JS bridge for the custom frameless title bar."""
 
-    def __init__(self) -> None:
+    def __init__(self, sandbox_token: str = "") -> None:
         # Keep native objects private. pywebview recursively exposes public
         # js_api attributes and traversing a WinForms window can hang WebView2.
         self._window: Any | None = None
         self._restore_bounds: tuple[int, int, int, int] | None = None
         self._tray: WindowsTray | None = None
         self._quitting = False
+        self._sandbox_token = sandbox_token
+
+    def sandbox_token(self) -> str:
+        """Private setting capability for this desktop window, not an HTTP API."""
+        return self._sandbox_token
 
     def _bind(self, window: Any) -> None:
         self._window = window
@@ -253,8 +258,144 @@ def _wait_until_ready(url: str, timeout: float = 15.0) -> None:
     raise RuntimeError("VeriPatch local service did not start")
 
 
+def _packaged_self_check(report_path: Path) -> int:
+    """Check the built executable without a window, live credentials, or the desktop mutex."""
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from veripatch.studio_api import create_studio_router
+    from veripatch.studio_domain import StudioSession
+    from veripatch.studio_store import StudioStore
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="ragent-package-check-") as directory:
+            root = Path(directory)
+            db = root / "state.db"
+            StudioStore(db).save(StudioSession(
+                session_id="check", repo_root=str(root), provider="deepseek",
+                model="test", reasoning_effort="low",
+            ), "created", {})
+            app = FastAPI()
+            app.include_router(create_studio_router(Settings(database_path=db)))
+            with TestClient(app) as client:
+                page = client.get("/studio")
+                if page.status_code != 200:
+                    raise RuntimeError("Packaged Vue page unavailable")
+                import re
+
+                asset = re.search(r'src="(/assets/[^" ]+\.js)"', page.text)
+                if asset is None or client.get(asset.group(1)).status_code != 200:
+                    raise RuntimeError("Packaged Vue JavaScript unavailable")
+                url = "/studio-api/sessions/check/skills"
+                content = (
+                    "---\nname: package-check\ndescription: >-\n"
+                    "  Check YAML\n  multiline parsing\n---\nNever execute scripts."
+                )
+                preview = client.post(url + "/preview", json={"content": content})
+                if preview.status_code != 200:
+                    raise RuntimeError(f"Packaged YAML preview failed: {preview.text}")
+                imported = client.post(url, json={"content": content})
+                if imported.status_code != 201:
+                    raise RuntimeError(f"Packaged skill import failed: {imported.text}")
+                modes = client.put(url, json={"modes": {"package-check": "auto"}})
+                if modes.status_code != 200:
+                    raise RuntimeError("Packaged skill modes unavailable")
+                removed = client.delete(url + "/package-check",
+                                        params={"version": imported.json()["version"]})
+                if removed.status_code != 200:
+                    raise RuntimeError("Packaged skill backup/delete unavailable")
+        result = {"ok": True, "checks": ["vue_page", "vue_assets", "yaml_multiline",
+                  "skill_preview", "skill_import", "skill_modes", "skill_backup_delete"]}
+        code = 0
+    except Exception as exc:
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        code = 1
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return code
+
+
+def _packaged_skill_sandbox_check(report_path: Path) -> int:
+    """Opt-in end-to-end check using the installed sandbox and external Python.
+
+    Does not install accounts, change policy, or request a host fallback.
+    Projects are disposable; the broker manages and releases its normal ACL leases.
+    """
+    import json
+    import shutil
+
+    from veripatch import studio_sandbox, studio_skills
+
+    try:
+        if os.name != "nt" or studio_sandbox.settings().mode != "required":
+            raise RuntimeError("This check requires Windows with sandbox mode=required")
+        python = shutil.which("python")
+        if not python:
+            raise RuntimeError("External Python is required; the EXE is not a Python interpreter")
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        example = base / "examples/skills/sales-report-demo"
+        files = {path.relative_to(example).as_posix(): path.read_bytes()
+                 for path in example.rglob("*") if path.is_file()}
+        checks = []
+        with tempfile.TemporaryDirectory(prefix="ragent-skill-sandbox-check-") as directory:
+            root = Path(directory)
+            installed = studio_skills.install_package(str(root), files)
+
+            def execute(folder: Path, *args: str):
+                result = studio_sandbox.run(
+                    root, [python, str(folder / "scripts/analyze.py"), *args],
+                    dict(os.environ), timeout=60, encoding="utf-8",
+                )
+                if not getattr(result, "sandboxed", False) or result.returncode != 0:
+                    raise RuntimeError(f"Sandbox execution failed: {result.stderr[-2000:]}")
+                return result.stdout
+
+            folder = Path(installed["base_directory"])
+            if "--input" not in execute(folder, "--help"):
+                raise RuntimeError("Script help unavailable")
+            checks.append("imported_skill_help_in_sandbox")
+            before = {key: (folder / key).read_bytes() for key in files}
+            report = json.loads(execute(folder))
+            if (report["completed_orders"], report["units"], report["revenue"]) != (4, 7, "269.80"):
+                raise RuntimeError("Incorrect sales result")
+            checks.append("imported_skill_analysis_in_sandbox")
+            # Reproduce the previous importer, which used a private mkdtemp.
+            legacy = Path(tempfile.mkdtemp(prefix=".legacy-", dir=folder.parent))
+            for relative, data in files.items():
+                destination = legacy / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            saved = studio_skills.remove(str(root), "sales-report-demo", installed["version"])
+            legacy.rename(folder)
+            repaired = studio_skills.repair_permissions(
+                str(root), "sales-report-demo", installed["version"]
+            )
+            if not Path(repaired["backup"]).is_dir() or not Path(saved["backup"]).is_dir():
+                raise RuntimeError("Repair failed to preserve backups")
+            if json.loads(execute(folder))["revenue"] != "269.80":
+                raise RuntimeError("Repaired legacy package failed")
+            if before != {key: (folder / key).read_bytes() for key in files}:
+                raise RuntimeError("Skill contents changed during execution or repair")
+            checks.extend(["legacy_private_package_repaired", "repaired_skill_in_sandbox",
+                           "unchanged_contents_and_backups"])
+        result = {"ok": True, "checks": checks}
+        code = 0
+    except Exception as exc:
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        code = 1
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return code
+
+
 def main() -> None:
     """Start the private API server and host it inside a native desktop window."""
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
+        raise SystemExit(_packaged_self_check(Path(sys.argv[2]).resolve()))
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-check-sandbox":
+        raise SystemExit(_packaged_skill_sandbox_check(Path(sys.argv[2]).resolve()))
     instance_mutex = _claim_single_instance()
     if instance_mutex is None:
         return
@@ -269,8 +410,9 @@ def main() -> None:
 
     port = _available_port()
     url = f"http://127.0.0.1:{port}"
+    app = create_app(_desktop_settings())
     config = uvicorn.Config(
-        create_app(_desktop_settings()),
+        app,
         host="127.0.0.1",
         port=port,
         log_level="warning",
@@ -280,7 +422,7 @@ def main() -> None:
     server_thread = threading.Thread(target=server.run, name="veripatch-server", daemon=True)
     server_thread.start()
     _wait_until_ready(url)
-    controls = WindowControls()
+    controls = WindowControls(app.state.sandbox_ui_token)
     window = webview.create_window(
         "RAgent",
         f"{url}/studio",

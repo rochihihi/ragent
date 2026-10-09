@@ -1,0 +1,7 @@
+order_id,date,product,quantity,unit_price,status
+S001,2026-10-01,Mouse,2,39.90,completed
+S002,2026-10-01,Keyboard,1,89.00,completed
+S003,2026-10-02,Cable,3,12.00,completed
+S004,2026-10-02,Stand,1,65.00,completed
+S005,2026-10-02,Mouse,5,39.90,cancelled
+S006,2026-10-03,Keyboard,1,89.00,refunded

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from dataclasses import replace
@@ -20,9 +21,10 @@ from pydantic import BaseModel, Field, SecretStr
 
 from veripatch.config import Settings
 from veripatch.credentials import credential_status, delete_api_key, load_api_key, save_api_key
-from veripatch.quota import get_provider_quota, refresh_pixel_tokens
-from veripatch.studio_api import create_studio_router
 from veripatch.mcp_management import create_mcp_management_router
+from veripatch.quota import get_provider_quota, refresh_pixel_tokens
+from veripatch.sandbox_management import create_sandbox_router
+from veripatch.studio_api import create_studio_router
 from veripatch.studio_model import parse_studio_decision
 
 
@@ -242,8 +244,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="3.0.0",
         description="Verifiable repository-level software repair agent.",
     )
-    app.include_router(create_studio_router(resolved_settings))
-    app.include_router(create_mcp_management_router())
+    app.state.sandbox_ui_token = secrets.token_urlsafe(32)
+    app.include_router(create_studio_router(resolved_settings, ui_token=app.state.sandbox_ui_token))
+    app.include_router(create_mcp_management_router(ui_token=app.state.sandbox_ui_token))
+    app.include_router(create_sandbox_router(app.state.sandbox_ui_token))
 
     @app.exception_handler(RequestValidationError)
     async def safe_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

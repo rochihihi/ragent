@@ -5,14 +5,21 @@ import json
 import os
 import tempfile
 from threading import Lock
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from veripatch import studio_sandbox
 from veripatch.mcp_client import (
-    _exchange, configuration_path, configured_servers, validate_servers,
+    _exchange,
+    configuration_path,
+    configured_servers,
+    external_config_fingerprint,
+    validate_servers,
 )
+from veripatch.sandbox_management import require_desktop_approval
 
 _LOCK = Lock()
 
@@ -24,6 +31,9 @@ class ServerUpdate(BaseModel):
 class TestConnection(BaseModel):
     confirmed: bool = False
     repo_root: str = Field(min_length=1, max_length=4096)
+    execution_mode: Literal["sandbox", "host"] = "sandbox"
+    confirm_host_execution: bool = False
+    configuration_fingerprint: str | None = None
 
 
 def _save(servers):
@@ -42,7 +52,7 @@ def _save(servers):
             os.unlink(temp)
 
 
-def create_mcp_management_router():
+def create_mcp_management_router(*, ui_token: str | None = None):
     router = APIRouter(prefix="/mcp-servers")
 
     def check_origin(request):
@@ -54,7 +64,10 @@ def create_mcp_management_router():
     def list_servers():
         try:
             return {"path": str(configuration_path()), "servers": [
-                {"name": name, "config": {key: value for key, value in config.items()
+                {"name": name,
+                 "configuration_fingerprint": external_config_fingerprint(f"{name}::list_tools")
+                     if config.get("enabled", True) else None,
+                 "config": {key: value for key, value in config.items()
                     if key in {"transport", "command", "args", "cwd", "url", "headers_env", "enabled"}},
                  "has_env": bool(config.get("env"))}
                 for name, config in configured_servers(include_disabled=True).items()
@@ -96,6 +109,17 @@ def create_mcp_management_router():
         check_origin(request)
         if not body.confirmed:
             raise HTTPException(403, "测试将启动程序或连接网络，需要明确确认")
+        host_approved = body.execution_mode == "host"
+        if host_approved:
+            require_desktop_approval(
+                ui_token, request.headers.get("x-veripatch-ui"),
+                request.headers.get("x-ragent-sandbox-key"),
+            )
+            if not body.confirm_host_execution:
+                raise HTTPException(403, "需要明确确认本次沙箱外连接测试")
+            if (studio_sandbox.settings().mode == "required"
+                    and not studio_sandbox.settings().allow_approved_host_execution):
+                raise HTTPException(403, "用户严格策略禁止沙箱外测试；请使用默认测试或手工调整策略")
         from pathlib import Path
         root = Path(body.repo_root).resolve()
         if not root.is_dir():
@@ -103,8 +127,15 @@ def create_mcp_management_router():
         try:
             if name not in configured_servers():
                 raise HTTPException(409, "服务不存在或已禁用")
-            tools = await _exchange(root, f"{name}::list_tools", {})
-            return {"ok": True, "tools": tools}
+            if host_approved and (
+                body.configuration_fingerprint != external_config_fingerprint(f"{name}::list_tools")
+            ):
+                raise HTTPException(409, "MCP 配置已变化，请刷新后核对完整命令并重新确认")
+            tools = await _exchange(
+                root, f"{name}::list_tools", {},
+                **({"host_execution_approved": True} if host_approved else {}),
+            )
+            return {"ok": True, "tools": tools, "execution_mode": body.execution_mode}
         except HTTPException:
             raise
         except (Exception, asyncio.CancelledError) as exc:

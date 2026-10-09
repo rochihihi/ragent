@@ -5,7 +5,7 @@ from __future__ import annotations
 import shlex
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -184,6 +184,7 @@ class StudioFinalReview(BaseModel):
 
 
 class StudioPermissionRequest(BaseModel):
+    approval_digest: str | None = Field(default=None, max_length=64)
     decision: dict[str, Any] | None = None
     request_id: str
     path: str
@@ -215,6 +216,8 @@ class StudioDecision(BaseModel):
     call_id: SkipJsonSchema[str | None] = None
     plan: list[StudioPlanItem] | None = Field(default=None, max_length=40)
     action: StudioAction
+    # A proposal, never authority: host execution requires a fresh UI approval.
+    execution_mode: Literal["sandbox", "host"] = "sandbox"
     rationale: str = Field(min_length=1, max_length=4_000)
     path: str | None = Field(default=None, max_length=1_000)
     access: str | None = Field(default=None, pattern="^(read|write)$")
@@ -350,6 +353,11 @@ class StudioDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> StudioDecision:
+        if self.execution_mode == "host" and self.action not in {
+            StudioAction.RUN_COMMAND, StudioAction.RUN_TESTS, StudioAction.START_TERMINAL,
+            StudioAction.WRITE_TERMINAL, StudioAction.MCP_CALL,
+        }:
+            raise ValueError("execution_mode=host only applies to process execution tools")
         if self.action is StudioAction.UPDATE_PLAN:
             if self.plan is None:
                 raise ValueError("update_plan requires plan; [] explicitly clears it")
@@ -470,6 +478,8 @@ class StudioSession(BaseModel):
     summary_observation_end: int = 0
     summary_version: int = 0
     enabled_skills: list[str] = Field(default_factory=list, max_length=10)
+    skill_modes: dict[str, Literal["auto", "pinned", "disabled"]] = Field(default_factory=dict)
+    active_skill_contents: dict[str, dict[str, Any]] = Field(default_factory=dict)
     session_id: str
     repo_root: str
     provider: str

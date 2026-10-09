@@ -82,6 +82,13 @@ class SafeWorkspace:
             raise ValueError(f"Only UTF-8 text files are supported: {path}") from exc
 
     def _assert_write_allowed(self, path: Path) -> None:
+        from veripatch.studio_sandbox import host_control_roots
+
+        if any(path == control or path.is_relative_to(control) or control.is_relative_to(path)
+               for control in host_control_roots()):
+            raise WorkspaceSecurityError(
+                "SandboxError: RAgent 宿主配置不能通过项目文件工具修改/删除；请使用设置界面。"
+            )
         roots = [self.root, *self.approved_write_roots]
         if not any(path == root or path.is_relative_to(root) for root in roots):
             raise WorkspaceSecurityError(f"Path requires write permission: {path}")
