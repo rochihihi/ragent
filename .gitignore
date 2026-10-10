@@ -20,6 +20,8 @@ frontend/dist/
 frontend/dist-vue/
 *.spec
 *.egg-info/
+.agents/skill-runtime/
+.agents/skill-backups/
 
 # Local regression outputs, packaging backups, and publication copies
 .test-*/

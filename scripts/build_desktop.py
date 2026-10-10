@@ -105,7 +105,7 @@ def main() -> None:
         "--paths",
         str(project / "src"),
         "--add-data",
-        f"{project / 'examples'};examples",
+        f"{project / 'examples' / 'skills'};examples/skills",
         "--add-data",
         f"{project / 'assets'};assets",
         "--add-data",

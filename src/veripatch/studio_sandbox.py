@@ -447,7 +447,7 @@ def prepare(
                     # other platforms still need both independent policies.
                     "denyWrite": (
                         [] if os.name == "nt" else [str(p.resolve()) for p in protected]
-                    ) + [str(runtime)],
+                    ) + [str(runtime), str(root.resolve() / ".agents" / "skill-runtime")],
                 },
             },
         }

@@ -90,6 +90,10 @@ class SafeWorkspace:
                 "SandboxError: RAgent 宿主配置不能通过项目文件工具修改/删除；请使用设置界面。"
             )
         roots = [self.root, *self.approved_write_roots]
+        for root in roots:
+            versions = root / ".agents" / "skill-runtime"
+            if path == versions or path.is_relative_to(versions) or versions.is_relative_to(path):
+                raise WorkspaceSecurityError("技能历史版本及注册表只允许通过技能管理更新")
         if not any(path == root or path.is_relative_to(root) for root in roots):
             raise WorkspaceSecurityError(f"Path requires write permission: {path}")
 

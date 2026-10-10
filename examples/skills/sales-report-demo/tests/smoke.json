@@ -1,0 +1,4 @@
+[
+  {"script": "scripts/analyze.py", "args": ["--help"], "contains": "--input"},
+  {"script": "scripts/analyze.py", "args": [], "contains": "269.80"}
+]

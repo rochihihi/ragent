@@ -30,7 +30,7 @@ def snapshot(root: Path, *, artifacts: bool = True) -> dict[str, str]:
         dirs[:] = [
             d
             for d in dirs
-            if d not in {".git", ".github", ".codex"}
+            if d not in {".git", ".github", ".codex", "skill-runtime", "skill-backups"}
             and not (Path(directory) / d).is_symlink()
             and (artifacts or d not in {"__pycache__", ".pytest_cache"})
         ]

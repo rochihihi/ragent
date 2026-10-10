@@ -10,6 +10,7 @@ from pathlib import Path
 IGNORED_DIRECTORIES = {
     ".git", ".hg", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
     ".venv", "__pycache__", "build", "dist", "node_modules", "venv",
+    "skill-runtime", "skill-backups",
 }
 
 

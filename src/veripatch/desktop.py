@@ -326,7 +326,8 @@ def _packaged_skill_sandbox_check(report_path: Path) -> int:
     import json
     import shutil
 
-    from veripatch import studio_sandbox, studio_skills
+    from veripatch import skill_runtime, studio_sandbox, studio_skills
+    from veripatch.studio_domain import StudioSession
 
     try:
         if os.name != "nt" or studio_sandbox.settings().mode != "required":
@@ -342,6 +343,24 @@ def _packaged_skill_sandbox_check(report_path: Path) -> int:
         with tempfile.TemporaryDirectory(prefix="ragent-skill-sandbox-check-") as directory:
             root = Path(directory)
             installed = studio_skills.install_package(str(root), files)
+            smoke = skill_runtime.run_smoke(
+                str(root), "sales-report-demo", installed["version"], confirmed=True,
+            )
+            if not smoke["passed"]:
+                raise RuntimeError(f"Snapshot smoke failed: {smoke['cases']}")
+            skill_runtime.configure(
+                str(root), "sales-report-demo", installed["version"], percent=100,
+                auto_rollback=False, min_samples=5, failure_rate=0.5, max_latency_ms=0,
+            )
+            session = StudioSession(
+                session_id="sandbox-version-check", repo_root=str(root), provider="deepseek",
+                model="self-check", reasoning_effort="low", skill_task_id="self-check",
+                skill_modes={"sales-report-demo": "auto"},
+            )
+            skill_runtime.bind(session, fresh=True)
+            bound = skill_runtime.version_detail(str(root), "sales-report-demo",
+                                                 installed["version"])
+            checks.append("confirmed_snapshot_smoke_in_sandbox")
 
             def execute(folder: Path, *args: str):
                 result = studio_sandbox.run(
@@ -361,6 +380,9 @@ def _packaged_skill_sandbox_check(report_path: Path) -> int:
             if (report["completed_orders"], report["units"], report["revenue"]) != (4, 7, "269.80"):
                 raise RuntimeError("Incorrect sales result")
             checks.append("imported_skill_analysis_in_sandbox")
+            if json.loads(execute(Path(bound["base_directory"])))["revenue"] != "269.80":
+                raise RuntimeError("Version snapshot execution failed")
+            checks.append("version_snapshot_analysis_in_sandbox")
             # Reproduce the previous importer, which used a private mkdtemp.
             legacy = Path(tempfile.mkdtemp(prefix=".legacy-", dir=folder.parent))
             for relative, data in files.items():
@@ -368,6 +390,9 @@ def _packaged_skill_sandbox_check(report_path: Path) -> int:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(data)
             saved = studio_skills.remove(str(root), "sales-report-demo", installed["version"])
+            if skill_runtime.bind(session, fresh=False)[0]["version"] != installed["version"]:
+                raise RuntimeError("Paused task lost its version after removal")
+            checks.append("task_version_survives_package_removal")
             legacy.rename(folder)
             repaired = studio_skills.repair_permissions(
                 str(root), "sales-report-demo", installed["version"]

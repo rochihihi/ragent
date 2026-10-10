@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -91,6 +92,25 @@ class SkillEdit(BaseModel):
 class SkillSelection(BaseModel):
     names: list[str] | None = Field(default=None, max_length=10)
     modes: dict[str, Literal["auto", "pinned", "disabled"]] | None = None
+
+
+class SkillReleasePolicy(BaseModel):
+    version: str = Field(min_length=64, max_length=64)
+    percent: int = Field(default=100, ge=0, le=100)
+    auto_rollback: bool = False
+    min_samples: int = Field(default=5, ge=3, le=100)
+    failure_rate: float = Field(default=0.5, gt=0, le=1)
+    max_latency_ms: int = Field(default=0, ge=0, le=600_000)
+
+
+class SkillRestore(BaseModel):
+    version: str = Field(min_length=64, max_length=64)
+    expected_version: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+class SkillSmoke(BaseModel):
+    version: str = Field(min_length=64, max_length=64)
+    confirmed: bool = False
 
 
 class _SkillBodyLimitedRoute(APIRoute):
@@ -360,9 +380,19 @@ def _restore_before_from_unified_diff(current: str, patch: str, path: str) -> st
 
 
 def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> APIRouter:
-    from veripatch import studio_skills
+    from veripatch import skill_runtime, studio_skills
 
-    router = APIRouter(route_class=_SkillBodyLimitedRoute)
+    watcher = skill_runtime.Watcher()
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        watcher.start()
+        try:
+            yield
+        finally:
+            watcher.close()
+
+    router = APIRouter(route_class=_SkillBodyLimitedRoute, lifespan=lifespan)
     store = StudioStore(settings.database_path)
     tasks: dict[str, asyncio.Task[None]] = {}
     steer_queues: dict[str, deque[str]] = {}
@@ -372,6 +402,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
     # `running` forever. Recover those sessions as resumable instead of making the UI
     # poll a task that no longer exists.
     for interrupted in store.list_sessions():
+        watcher.add(interrupted.repo_root)
         if interrupted.status == "running":
             interrupted.status = "idle"
             interrupted.activity = "idle"
@@ -427,7 +458,8 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
     def list_skills(session_id: str):
         session = load_session(session_id)
         try:
-            listing = studio_skills.listing(session.repo_root)
+            watcher.add(session.repo_root)
+            listing = skill_runtime.cached_listing(session.repo_root)
             return {
                 **listing,
                 "enabled": session.enabled_skills,
@@ -437,7 +469,69 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                 },
                 "active": list(session.active_skill_contents),
                 "locked": session.status in {"running", "waiting_permission"},
+                "releases": skill_runtime.releases(session.repo_root),
+                "bindings": session.skill_bindings,
             }
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.get("/studio-api/sessions/{session_id}/skills/history")
+    def skill_history(session_id: str):
+        session = load_session(session_id)
+        try:
+            return skill_runtime.releases(session.repo_root)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    def skill_management_session(session_id: str):
+        session = load_session(session_id)
+        if session_id in tasks or session.status in {"running", "waiting_permission"}:
+            raise HTTPException(409, "请等待当前任务结束后管理技能")
+        watcher.add(session.repo_root)
+        return session
+
+    @router.post("/studio-api/sessions/{session_id}/skills/{name}/restore")
+    def restore_skill(session_id: str, name: str, request: SkillRestore):
+        session = skill_management_session(session_id)
+        try:
+            result = skill_runtime.restore(session.repo_root, name, request.version,
+                                           request.expected_version)
+            session.skill_modes.setdefault(name, "auto")
+            store.save(session, "skill_restored", {
+                "name": name, "version": request.version,
+                "summary": "技能历史版本已恢复，仅影响后续新任务；外部操作未撤销。",
+            })
+            return result
+        except studio_skills.SkillConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.put("/studio-api/sessions/{session_id}/skills/{name}/release")
+    def release_skill(session_id: str, name: str, request: SkillReleasePolicy):
+        session = skill_management_session(session_id)
+        try:
+            result = skill_runtime.configure(session.repo_root, name, **request.model_dump())
+            store.append_event(session_id, "skill_release_updated", {
+                "name": name, "version": request.version, "summary": result["notice"],
+            })
+            return {"notice": result["notice"]}
+        except studio_skills.SkillConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/studio-api/sessions/{session_id}/skills/{name}/smoke")
+    def smoke_skill(session_id: str, name: str, request: SkillSmoke):
+        session = skill_management_session(session_id)
+        try:
+            result = skill_runtime.run_smoke(session.repo_root, name, request.version,
+                                             confirmed=request.confirmed)
+            store.append_event(session_id, "skill_smoke_finished", {
+                "name": name, "version": request.version, "passed": result["passed"],
+                "summary": "技能冒烟测试通过" if result["passed"] else "技能冒烟测试未通过",
+            })
+            return result
         except (ValueError, OSError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -477,6 +571,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
         if session.status in {"running", "waiting_permission"}:
             raise HTTPException(409, "请等待任务结束后管理技能")
         try:
+            watcher.add(session.repo_root)
             result = studio_skills.install_package(
                 session.repo_root, skill_package(request), replace=request.replace,
                 expected_version=request.expected_version,
@@ -911,6 +1006,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
         record_user_message: bool = True,
         resume_after_permission: bool = False,
     ) -> None:
+        watcher.add(session.repo_root)
         model_settings = replace(
             settings,
             model=(

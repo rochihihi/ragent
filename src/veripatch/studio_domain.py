@@ -480,6 +480,8 @@ class StudioSession(BaseModel):
     enabled_skills: list[str] = Field(default_factory=list, max_length=10)
     skill_modes: dict[str, Literal["auto", "pinned", "disabled"]] = Field(default_factory=dict)
     active_skill_contents: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    skill_bindings: dict[str, str] = Field(default_factory=dict)
+    skill_task_id: str = ""
     session_id: str
     repo_root: str
     provider: str

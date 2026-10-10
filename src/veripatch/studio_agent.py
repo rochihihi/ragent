@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import time
 from collections.abc import Callable
 from itertools import count
 from pathlib import Path
@@ -133,7 +134,8 @@ def _requests_code_change(message: str) -> bool:
 
 
 def _file_tree(root: Path, limit: int = 240) -> list[str]:
-    ignored = {".git", ".venv", "venv", "node_modules", "runs", "build", "dist", "skill-backups"}
+    ignored = {".git", ".venv", "venv", "node_modules", "runs", "build", "dist",
+               "skill-backups", "skill-runtime"}
     files: list[str] = []
     for path in root.rglob("*"):
         relative = path.relative_to(root)
@@ -187,13 +189,24 @@ class StudioAgent:
         user_message: str,
         **options: Any,
     ) -> StudioSession:
-        try:
-            result = await self._handle(session, user_message, **options)
-        except UserPauseRequested:
-            return self._pause(session, "用户暂停了执行。")
-        if result.status == "running":
-            return self._pause(result, "执行已停止，但任务尚未满足完成条件。")
-        return result
+        from veripatch import skill_runtime
+
+        started = time.monotonic()
+        with skill_runtime.task_scope():
+            try:
+                result = await self._handle(session, user_message, **options)
+            except UserPauseRequested:
+                return self._pause(session, "用户暂停了执行。")
+            if result.status == "running":
+                return self._pause(result, "执行已停止，但任务尚未满足完成条件。")
+            if result.status in {"idle", "completed", "failed"}:
+                for name, item in session.active_skill_contents.items():
+                    skill_runtime.record(
+                        session.repo_root, name, item["version"],
+                        success=result.status != "failed", task=True,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                    )
+            return result
 
     async def _await_model(self, awaitable):
         """Cancel model I/O on pause; synchronous tools finish and commit first."""
@@ -221,11 +234,6 @@ class StudioAgent:
     ) -> StudioSession:
         from veripatch import studio_skills
 
-        try:
-            skill_instructions = studio_skills.selected(session.repo_root, session.enabled_skills)
-            skill_catalog = studio_skills.catalog(session)
-        except (ValueError, OSError) as exc:
-            return self._pause(session, f"技能加载失败：{exc}")
         previous_failure = session.failure_reason
         user_message_recorded = False
         resume_words = {"继续", "继续吧", "继续执行", "重试", "resume", "continue"}
@@ -245,8 +253,17 @@ class StudioAgent:
             and (previous_request is not None or bool(session.plan))
             and session.status != "completed"
         )
-        if not is_resume and not resume_after_permission:
-            session.active_skill_contents = {}
+        from veripatch import skill_runtime
+
+        fresh = not is_resume and not resume_after_permission
+        if fresh or not session.skill_task_id:
+            session.skill_task_id = uuid4().hex
+        try:
+            skill_catalog = skill_runtime.bind(session, fresh=fresh)
+            skill_instructions = [studio_skills.activate(session, name)
+                                  for name in session.enabled_skills]
+        except (ValueError, OSError) as exc:
+            return self._pause(session, f"技能加载失败：{exc}")
         for item in skill_instructions:
             session.active_skill_contents.setdefault(item["name"], item)
         explicit = studio_skills.explicit_names(
@@ -254,7 +271,7 @@ class StudioAgent:
         )
         requested = studio_skills.explicit_names(
             user_message,
-            {item["name"] for item in studio_skills.listing(session.repo_root)["items"]},
+            {item["name"] for item in skill_runtime.cached_listing(session.repo_root)["items"]},
         )
         disabled = [name for name in requested if name not in explicit]
         if disabled:
@@ -2541,9 +2558,12 @@ class StudioAgent:
         *,
         permission_checked: bool = False,
     ) -> bool:
+        from veripatch import skill_runtime
+
         action = decision.action
         if action is StudioAction.RUN_TESTS and session.verification_mode == "strict":
             decision = decision.model_copy(update={"command": session.test_command})
+        decision = skill_runtime.guard_action(session, decision)
         if action is StudioAction.UPDATE_PLAN:
             session.plan = [item.model_copy(deep=True) for item in decision.plan or []]
             observation = StudioObservation(kind="plan_updated", summary="模型已更新任务计划。",
@@ -2559,11 +2579,6 @@ class StudioAgent:
             )
         if self._enforce_capability(session, workspace, decision):
             return True
-        if (
-            action is StudioAction.RUN_TESTS
-            and session.verification_mode is VerificationMode.STRICT
-        ):
-            decision = decision.model_copy(update={"command": session.test_command})
         if action is StudioAction.WRITE_TERMINAL and decision.terminal_id:
             # Input to an existing host shell is another host execution, not a
             # sandboxed call merely because the model omits the mode field.
@@ -2631,6 +2646,7 @@ class StudioAgent:
         if observation is None:
             observation = self.executor.git(session, workspace, decision)
         if observation is None:
+            skill_command_started = time.monotonic()
             observation = self.executor.command(
                 session,
                 workspace,
@@ -2640,6 +2656,17 @@ class StudioAgent:
                 action_approved,
                 session.approved_capabilities,
             )
+            if observation is not None and observation.kind == "command":
+                for name, version in session.skill_bindings.items():
+                    base = str(skill_runtime._path(session.repo_root, name, version))
+                    if any(base.replace("\\", "/").casefold() in
+                           a.replace("\\", "/").casefold() for a in decision.command):
+                        exit_code = observation.payload.get("exit_code")
+                        if exit_code is not None:
+                            skill_runtime.record(
+                                session.repo_root, name, version, success=exit_code == 0,
+                                latency_ms=int((time.monotonic() - skill_command_started) * 1000),
+                            )
         if observation is None:
             observation = self.executor.process(
                 session, workspace, decision, command_grants, action_approved

@@ -14,7 +14,7 @@ Local-first does not mean offline inference: selected project content is sent to
 
 - **Model-led workflow:** one Studio runtime. The model interprets the original request and chooses tools, plans, verification, and responses. Plans do not grant permissions.
 - **Desktop workspace:** persistent conversations, project tree, file creation, Diff review, Git operations, skills, execution history, and per-request context usage.
-- **Skill packages:** folder/ZIP imports with scripts and references, safe YAML parsing, automatic/pinned/disabled session modes, `$name` invocation, and three-tier loading. Updates, removal, and legacy Windows permission repairs preserve backups. [Skill guide](docs/skills.md).
+- **Versioned skills:** folder/ZIP imports, three-tier loading, session modes and `$name` invocation. Debounced hot reload preserves last-good packages; tasks pin complete snapshots. History restore, opt-in sandbox smoke tests, canary rollout and metric-triggered rollback are available in skill management. No automatic dependency installation or undo of external side effects. [Skill guide](docs/skills.md).
 - **Controlled execution:** concrete command/argument previews, one-time and matching session approvals, native workspace path checks, and protected repository metadata.
 - **Pause/resume:** no default fixed decision-step limit. Pending model I/O can be cancelled; synchronous tools finish and save results before pausing. Ambiguous recovered calls are not blindly replayed.
 - **Verification:** the model chooses relevant checks and may write tests. Failures return as tool evidence. Default modes do not enforce a test-and-reopen sequence; Strict adds completion gates. Completion is not proof of passing tests or visual GUI inspection.

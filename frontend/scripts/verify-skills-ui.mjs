@@ -72,8 +72,21 @@ try {
   await dialog.getByText("已从项目技能中移除", { exact: false }).waitFor();
   const list = await (await fetch(`${url}/studio-api/sessions/skills-ui/skills`)).json();
   assert.equal(list.items.length, 0);
+  await dialog.getByRole("button", { name: "历史版本", exact: true }).click();
+  await dialog.getByRole("heading", { name: "历史版本与恢复" }).waitFor();
+  assert.ok(await dialog.getByRole("button", { name: "恢复", exact: true }).count() >= 2);
+  await dialog.getByRole("button", { name: "恢复", exact: true }).first().click();
+  await dialog.getByRole("button", { name: "确认恢复", exact: true }).click();
+  await dialog.getByText("历史版本已恢复；已有任务不切换，外部操作未撤销。").waitFor();
+  await dialog.locator("summary").filter({ hasText: "发布、灰度与冒烟测试" }).click();
+  await dialog.getByLabel("新版流量（%）").fill("100");
+  await dialog.getByLabel("指标异常自动回退后续任务").check();
+  await dialog.getByLabel("最少执行样本").fill("3");
+  await dialog.getByRole("button", { name: "保存发布策略", exact: true }).click();
+  await dialog.getByText("已发布；只影响后续新任务。").waitFor();
+  await page.screenshot({ path: path.join(artifact, "release.png") });
   assert.deepEqual(errors, []);
-  console.log("PASS: folder import, trust/preview, lazy resources, modes, permission repair/backup, edit, backup delete, desktop/narrow layout.");
+  console.log("PASS: folder import, trust/preview, lazy resources, modes, permission repair/backup, edit, delete/history restore, release policy, desktop/narrow layout.");
   console.log(`Screenshots: ${artifact}`);
 } finally {
   await browser?.close();

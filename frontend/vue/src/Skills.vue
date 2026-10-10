@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import Modal from "./Modal.vue";
 
 type Mode = "auto" | "pinned" | "disabled";
 type Entry = { path: string; size: number };
 type Skill = { name: string; description: string; compatibility: string; files: Entry[]; version: string; content?: string; base_directory: string };
-type Listing = { items: Skill[]; modes: Record<string, Mode>; diagnostics: { name: string; message: string }[]; active: string[]; locked: boolean };
+type ReleaseVersion = { created_at: number; checks: { static: string; smoke_cases: number; executable_smoke: string }; references: number; metrics: { executions: number; errors: number; mean_latency_ms: number; task_samples: number; task_successes: number } };
+type Release = { active: string | null; candidate: string | null; percent: number; deleted?: boolean; notice: string; watch_error?: string; versions: Record<string, ReleaseVersion>; policy: { auto_rollback: boolean; min_samples: number; failure_rate: number; max_latency_ms: number } };
+type Listing = { items: Skill[]; modes: Record<string, Mode>; diagnostics: { name: string; message: string; version?: string }[]; active: string[]; locked: boolean; releases: Record<string, Release>; bindings: Record<string, string> };
 type ImportBody = { content?: string; files?: { path: string; data: string }[]; archive?: string };
 type Preview = Skill & { existing_version: string | null; total_bytes: number };
 type Resource = { path: string; kind: string; content: string; size: number; truncated?: boolean };
@@ -16,7 +18,13 @@ const modes = ref<Record<string, Mode>>({}), saved = ref<Record<string, Mode>>({
 const active = ref<string[]>([]), locked = ref(false), busy = ref(false);
 const error = ref(""), notice = ref(""), query = ref("");
 const selected = ref<Skill | null>(null), resource = ref<Resource | null>(null);
-const view = ref<"detail" | "import">("detail"), editing = ref(false), editText = ref("");
+const view = ref<"detail" | "import" | "history">("detail"), editing = ref(false), editText = ref("");
+const releases = ref<Record<string, Release>>({}), bindings = ref<Record<string, string>>({});
+const releasePercent = ref(100), autoRollback = ref(false), minSamples = ref(5), failureRate = ref(0.5), maxLatency = ref(0);
+const smokeConfirm = ref(false), smokeResult = ref("");
+const restoring = ref<{ name: string; version: string } | null>(null);
+const currentRelease = computed(() => selected.value ? releases.value[selected.value.name] : undefined);
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
 const source = ref<"file" | "folder" | "zip" | "text">("folder"), text = ref("");
 const upload = ref<ImportBody | null>(null), uploadLabel = ref("");
 const preview = ref<Preview | null>(null), trusted = ref(false), replaceConfirmed = ref(false);
@@ -43,6 +51,7 @@ async function perform(action: () => Promise<void>) {
 async function load(preserve = false) {
   const data = await request<Listing>();
   items.value = data.items; diagnostics.value = data.diagnostics; active.value = data.active; locked.value = data.locked;
+  releases.value = data.releases ?? {}; bindings.value = data.bindings ?? {};
   modes.value = preserve ? Object.fromEntries(data.items.map(i => [i.name, modes.value[i.name] ?? data.modes[i.name] ?? "disabled"])) : { ...data.modes };
   saved.value = { ...data.modes };
 }
@@ -54,10 +63,20 @@ async function choose(item: Skill) {
   if (!mayLeaveEditor()) return;
   selected.value = await request<Skill>(`/${encodeURIComponent(item.name)}`);
   editing.value = false; resource.value = null; deleting.value = false; repairing.value = false; view.value = "detail";
+  const release = releases.value[item.name];
+  releasePercent.value = release?.candidate ? release.percent : 100;
+  autoRollback.value = release?.policy.auto_rollback ?? false;
+  minSamples.value = release?.policy.min_samples ?? 5;
+  failureRate.value = release?.policy.failure_rate ?? 0.5;
+  maxLatency.value = release?.policy.max_latency_ms ?? 0;
+  smokeConfirm.value = false; smokeResult.value = "";
 }
 function openImport() {
   if (!mayLeaveEditor()) return;
   view.value = "import"; deleting.value = false; error.value = "";
+}
+function openHistory() {
+  if (mayLeaveEditor()) view.value = "history";
 }
 function resetPreview() { preview.value = null; trusted.value = false; replaceConfirmed.value = false; }
 function changeSource(value: typeof source.value) {
@@ -134,12 +153,43 @@ async function showResource(path: string) {
   if (!selected.value) return;
   resource.value = await request<Resource>(`/${encodeURIComponent(selected.value.name)}/resource?path=${encodeURIComponent(path)}`);
 }
+async function publishRelease() {
+  if (!selected.value) return;
+  const data = await request<{ notice: string }>(`/${encodeURIComponent(selected.value.name)}/release`, "PUT", {
+    version: selected.value.version, percent: releasePercent.value, auto_rollback: autoRollback.value,
+    min_samples: minSamples.value, failure_rate: failureRate.value, max_latency_ms: maxLatency.value,
+  });
+  notice.value = data.notice + "；只影响后续新任务。";
+  await load(true);
+}
+async function runSmoke() {
+  if (!selected.value || !smokeConfirm.value) return;
+  const data = await request<{ passed: boolean; cases: object[]; notice: string }>(`/${encodeURIComponent(selected.value.name)}/smoke`, "POST", { version: selected.value.version, confirmed: true });
+  smokeResult.value = JSON.stringify(data, null, 2); smokeConfirm.value = false;
+  notice.value = data.passed ? "冒烟测试通过，可以发布该版本。" : "冒烟测试未通过，新版保持未发布。";
+  await load(true);
+}
+async function restoreVersion() {
+  if (!restoring.value) return;
+  const { name, version } = restoring.value;
+  const installed = items.value.find(i => i.name === name);
+  const expectedVersion = installed?.version ?? diagnostics.value.find(d => d.name === name)?.version ?? null;
+  const result = await request<Skill>(`/${encodeURIComponent(name)}/restore`, "POST", { version, expected_version: expectedVersion });
+  restoring.value = null; notice.value = "历史版本已恢复；已有任务不切换，外部操作未撤销。";
+  await load(true); await choose(result);
+}
 function close() {
   if (busy.value) return;
   if (dirty.value || editDirty.value) { closing.value = true; return; }
   emit("close");
 }
-onMounted(() => void perform(load));
+onMounted(() => {
+  void perform(load);
+  refreshTimer = setInterval(() => {
+    if (!busy.value) void load(true).catch(e => { error.value = (e as Error).message; });
+  }, 3000);
+});
+onUnmounted(() => { if (refreshTimer) clearInterval(refreshTimer); });
 </script>
 
 <template>
@@ -151,7 +201,7 @@ onMounted(() => void perform(load));
     <p v-if="notice" class="skills-notice" role="status">{{ notice }}</p>
     <div class="skills-layout">
       <aside class="skills-sidebar">
-        <div class="skills-toolbar"><button :disabled="readonly" @click="openImport">＋ 导入技能</button><button :disabled="busy" @click="perform(async () => { if (!mayLeaveEditor()) return; await load(true); if (selected) await choose(selected); })">刷新</button></div>
+        <div class="skills-toolbar"><button :disabled="readonly" @click="openImport">＋ 导入技能</button><button :disabled="busy" @click="perform(async () => { if (!mayLeaveEditor()) return; await load(true); if (selected && items.some(i => i.name === selected?.name)) await choose(selected); })">刷新</button><button :disabled="busy" @click="openHistory">历史版本</button></div>
         <input v-model="query" aria-label="搜索技能" placeholder="搜索名称或描述" />
         <div class="skills-list">
           <p v-if="!filtered.length" class="skills-muted">{{ items.length ? '没有匹配技能' : '暂无技能，导入文件夹、ZIP 或 SKILL.md 开始使用。' }}</p>
@@ -160,7 +210,17 @@ onMounted(() => void perform(load));
         <details v-if="diagnostics.length" class="skills-diagnostics"><summary>{{ diagnostics.length }} 个技能无法加载</summary><p v-for="d in diagnostics" :key="d.name"><strong>{{ d.name }}</strong><br />{{ d.message }}</p></details>
       </aside>
       <main class="skills-main">
-        <template v-if="view === 'import'">
+        <template v-if="view === 'history'">
+          <h3>历史版本与恢复</h3><p class="skills-muted">恢复只影响新任务，不撤销已执行的外部操作。版本保留供暂停任务恢复，不自动删除。</p>
+          <div v-if="restoring" class="skills-confirm"><p>确认将 {{ restoring.name }} 恢复为 {{ restoring.version.slice(0, 12) }}？当前文件会备份。</p><button :disabled="readonly" @click="perform(restoreVersion)">确认恢复</button><button @click="restoring = null">取消</button></div>
+          <section v-for="(release, name) in releases" :key="name" class="skills-preview">
+            <h4>{{ name }} <small v-if="release.deleted">已删除，可恢复</small></h4>
+            <p class="skills-muted">{{ release.notice }}</p>
+            <ul class="skills-files"><li v-for="(record, version) in release.versions" :key="version"><span>{{ String(version).slice(0, 12) }} · {{ new Date(record.created_at * 1000).toLocaleString() }}<br />执行 {{ record.metrics.executions }} · 失败 {{ record.metrics.errors }} · 平均 {{ record.metrics.mean_latency_ms }} ms · 使用中 {{ record.references }}<br />静态 {{ record.checks.static }} · 冒烟 {{ record.checks.executable_smoke }}</span><button :disabled="readonly" @click="restoring = { name: String(name), version: String(version) }">恢复</button></li></ul>
+          </section>
+          <p v-if="!Object.keys(releases).length" class="skills-muted">升级后导入或加载技能时会建立历史版本。</p>
+        </template>
+        <template v-else-if="view === 'import'">
           <h3>导入技能</h3><p class="skills-muted">选择一个含 SKILL.md 的技能目录，脚本、资料和模板会一并保留。</p>
           <div class="skills-tabs"><button v-for="tab in (['folder', 'zip', 'file', 'text'] as const)" :key="tab" :class="{ active: source === tab }" :disabled="readonly" @click="changeSource(tab)">{{ { folder: '文件夹', zip: 'ZIP 包', file: 'SKILL.md', text: '粘贴文本' }[tab] }}</button></div>
           <label v-if="source === 'folder'">选择完整技能文件夹<input type="file" webkitdirectory multiple :disabled="readonly" @change="pick" /></label>
@@ -181,13 +241,26 @@ onMounted(() => void perform(load));
         </template>
         <template v-else-if="selected">
           <div class="skills-detail-head"><h3>{{ selected.name }}</h3><span class="skills-muted">{{ selected.files.length }} 个文件</span></div><p>{{ selected.description }}</p>
+          <p class="skills-muted">安装 {{ selected.version.slice(0, 12) }} · 发布 {{ currentRelease?.active?.slice(0, 12) ?? '待发布' }} · 本任务 {{ bindings[selected.name]?.slice(0, 12) ?? '未绑定' }}</p>
+          <p v-if="items.find(i => i.name === selected?.name)?.version !== selected.version" class="vue-notice">文件已在外部变更，当前编辑内容未被覆盖；请刷新后再保存。</p>
+          <p v-if="currentRelease?.watch_error" class="form-error">新版校验失败，保留上次发布版本：{{ currentRelease.watch_error }}</p>
+          <p v-if="currentRelease" class="skills-muted">{{ currentRelease.notice }}</p>
           <label>本会话使用方式<select v-model="modes[selected.name]" :disabled="readonly"><option value="auto">自动选择</option><option value="pinned">固定启用</option><option value="disabled">禁用</option></select></label>
           <p class="skills-muted">{{ modes[selected.name] === 'auto' ? '只提供名称和描述，由模型按任务加载；也可用 $' + selected.name + ' 指定。' : modes[selected.name] === 'pinned' ? '本会话每次请求都加载完整说明，适合持续使用的工作流。' : '不向模型提供此技能，也不允许按需激活。' }}</p>
           <p v-if="selected.compatibility" class="skills-muted">环境要求：{{ selected.compatibility }}</p>
           <details class="skills-location"><summary>存放位置</summary><p>{{ selected.base_directory }}</p></details>
+          <details class="skills-release"><summary>发布、灰度与冒烟测试</summary>
+            <p class="skills-muted">任务绑定完整版本。灰度按新任务分流，不在任务中途切换。没有样例时只做静态检查。</p>
+            <label>新版流量（%）<input v-model.number="releasePercent" type="number" min="0" max="100" :disabled="readonly" /></label>
+            <label class="vue-check"><input v-model="autoRollback" type="checkbox" :disabled="readonly" />指标异常自动回退后续任务</label>
+            <template v-if="autoRollback"><label>最少执行样本<input v-model.number="minSamples" type="number" min="3" max="100" :disabled="readonly" /></label><label>失败比例阈值（0–1）<input v-model.number="failureRate" type="number" min="0.01" max="1" step="0.1" :disabled="readonly" /></label><label>平均耗时阈值（毫秒，0 表示不检查）<input v-model.number="maxLatency" type="number" min="0" max="600000" :disabled="readonly" /></label></template>
+            <button :disabled="readonly || editing" @click="perform(publishRelease)">保存发布策略</button>
+            <template v-if="currentRelease?.versions[selected.version]?.checks.smoke_cases"><p class="skills-muted">执行 tests/smoke.json 中的脚本，仍可能修改工作区或产生允许的外部副作用。</p><label class="vue-check"><input v-model="smokeConfirm" type="checkbox" :disabled="readonly" />确认在默认沙箱中执行这些测试</label><button :disabled="readonly || !smokeConfirm" @click="perform(runSmoke)">运行冒烟测试</button></template>
+            <pre v-if="smokeResult" class="vue-code">{{ smokeResult }}</pre>
+          </details>
           <div class="skills-toolbar"><button v-if="!editing" :disabled="readonly" @click="editing = true; editText = selected.content ?? ''; resource = null">编辑说明</button><template v-else><button class="primary" :disabled="readonly || !editDirty" @click="perform(saveEdit)">保存说明</button><button :disabled="busy" @click="editing = false">取消编辑</button></template><button :disabled="readonly || editing" @click="repairing = !repairing; deleting = false">修复执行权限</button><button :disabled="readonly || editing" @click="deleting = !deleting; repairing = false">删除技能</button></div>
           <div v-if="repairing" class="skills-confirm"><p>适用于旧版导入后脚本报 Permission denied：将原文件备份，再按项目的权限继承重新保存。不会新增账户权限、关闭沙箱或运行脚本；使用方式保持不变。</p><button :disabled="readonly" @click="repairing = false">取消</button><button :disabled="readonly" @click="perform(repairPermissions)">确认修复并备份</button></div>
-          <div v-if="deleting" class="skills-confirm"><p>从项目移除 {{ selected.name }}？所有会话都将无法再使用它，原文件会移入备份目录。</p><button :disabled="readonly" @click="deleting = false">取消</button><button class="danger" :disabled="readonly" @click="perform(removeSkill)">确认移除并备份</button></div>
+          <div v-if="deleting" class="skills-confirm"><p>从项目移除 {{ selected.name }}？后续新任务不再加载，已有任务仍使用绑定版本；原文件会移入备份目录。</p><button :disabled="readonly" @click="deleting = false">取消</button><button class="danger" :disabled="readonly" @click="perform(removeSkill)">确认移除并备份</button></div>
           <textarea v-if="editing" v-model="editText" rows="15" maxlength="12000" :disabled="readonly" aria-label="编辑技能说明" class="skills-editor" />
           <details v-else><summary>完整说明</summary><pre class="vue-code">{{ selected.content }}</pre></details>
           <h4>资源文件</h4><ul class="skills-files"><li v-for="file in selected.files" :key="file.path"><button :disabled="busy" @click="perform(() => showResource(file.path))">{{ file.path }}</button><small>{{ size(file.size) }}</small></li></ul>

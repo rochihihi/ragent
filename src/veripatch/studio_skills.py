@@ -191,7 +191,12 @@ def listing(project: str) -> dict[str, Any]:
             item = detail(project, path.name)
             items.append({k: v for k, v in item.items() if k != "content"})
         except (ValueError, OSError, UnicodeError) as exc:
-            diagnostics.append({"name": path.name, "message": str(exc)})
+            diagnostic = {"name": path.name, "message": str(exc)}
+            try:
+                diagnostic["version"] = _version(_files(_directory(project, path.name)))
+            except (ValueError, OSError):
+                pass  # Unsafe packages require manual repair, never overwrite through a link.
+            diagnostics.append(diagnostic)
     return {"items": items, "diagnostics": diagnostics}
 
 
@@ -315,8 +320,12 @@ def install_package(
     *,
     replace: bool = False,
     expected_version: str | None = None,
+    release_percent: int | None = None,
 ) -> dict[str, Any]:
     with _LOCK:
+        from veripatch import skill_runtime
+
+        skill_runtime.check_package(files)
         info = preview(project, files)
         root = root_for(project)
         target = _directory(project, info["name"])
@@ -325,6 +334,9 @@ def install_package(
                 raise FileExistsError("同名技能已存在")
             if not expected_version or info["existing_version"] != expected_version:
                 raise SkillConflictError("技能在预览后已变更，请刷新并重新确认")
+            # Preserve the complete previous package before replacing any bytes.
+            if info["name"] not in skill_runtime.releases(project):
+                skill_runtime.publish(project, info["name"], reason="before_update")
         elif replace:
             raise SkillConflictError("原技能已不存在，请重新预览导入")
         root.mkdir(parents=True, exist_ok=True)
@@ -351,6 +363,16 @@ def install_package(
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
+        try:
+            skill_runtime.publish(project, info["name"], percent=release_percent)
+        except BaseException:
+            # Roll back the filesystem too if registry publication fails.
+            failed = root / f".failed-{uuid4().hex}"
+            target.rename(failed)
+            if backup is not None:
+                backup.rename(target)
+            shutil.rmtree(failed)
+            raise
         return {**detail(project, info["name"]), "backup": str(backup) if backup else None}
 
 
@@ -384,10 +406,18 @@ def repair_permissions(project: str, name: str, expected_version: str) -> dict[s
 
 def remove(project: str, name: str, expected_version: str) -> dict[str, str]:
     with _LOCK:
+        from veripatch import skill_runtime
+
         target = _directory(project, name)
         if not target.is_dir() or _version(_files(target)) != expected_version:
             raise SkillConflictError("技能已变更或不存在，请刷新后重试")
-        return {"name": name, "backup": str(_backup(project, target))}
+        backup = _backup(project, target)
+        try:
+            skill_runtime.retire(project, name)
+        except BaseException:
+            backup.rename(target)
+            raise
+        return {"name": name, "backup": str(backup)}
 
 
 def resource(project: str, name: str, relative: str) -> dict[str, Any]:
@@ -442,10 +472,22 @@ def explicit_names(message: str, available: set[str]) -> list[str]:
 
 
 def activate(session: Any, name: str) -> dict[str, Any]:
+    from veripatch import skill_runtime
+
     if mode_for(session, name) == "disabled":
         raise ValueError("技能已禁用，请先在技能管理中启用")
     if name not in session.active_skill_contents:
-        item = detail(session.repo_root, name)
+        version = session.skill_bindings.get(name)
+        if version is None:
+            entry = skill_runtime.releases(session.repo_root).get(name)
+            if entry is None:
+                skill_runtime.publish(session.repo_root, name, reason="initial_capture")
+                entry = skill_runtime.releases(session.repo_root)[name]
+            version = entry.get("active")
+            if not version or entry.get("deleted"):
+                raise ValueError("技能尚未通过发布检查或已删除")
+            session.skill_bindings[name] = version
+        item = skill_runtime.version_detail(session.repo_root, name, version)
         size = sum(len(i["content"]) for i in session.active_skill_contents.values())
         if size + len(item["content"]) > MAX_ACTIVE_CHARS:
             raise ValueError("本次加载的技能内容超过 60000 字符")
@@ -454,6 +496,12 @@ def activate(session: Any, name: str) -> dict[str, Any]:
 
 
 def activation_for_read(session: Any, path: Path) -> dict[str, Any] | None:
+    from veripatch import skill_runtime
+
+    for name, version in session.skill_bindings.items():
+        if path.resolve() == (skill_runtime._path(session.repo_root, name, version)
+                              / "SKILL.md").resolve():
+            return activate(session, name)
     root = root_for(session.repo_root).resolve()
     resolved = path.resolve()
     if not resolved.is_relative_to(root):
