@@ -67,7 +67,7 @@ from veripatch.studio_memory import (
 from veripatch.studio_permissions import fingerprint as approval_fingerprint
 from veripatch.studio_permissions import requires_approval, session_grant_matches
 from veripatch.studio_runtime import StudioExecutionRuntime
-from veripatch.studio_store import StudioStore
+from veripatch.studio_store import IdempotencyConflict, StudioStore, payload_digest
 from veripatch.studio_tools import (
     TERMINALS as TERMINALS,  # Compatibility export for runtime integrations.
 )
@@ -164,7 +164,7 @@ class StudioAgent:
         *,
         max_steps: int | None = None,
         max_context_tokens: int = DEFAULT_CONTEXT_LIMIT,
-        consume_steer: Callable[[], str | None] | None = None,
+        consume_steer: Callable[[], str | tuple[str, str] | None] | None = None,
         pause_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.model = model
@@ -213,6 +213,7 @@ class StudioAgent:
                         session.repo_root, name, item["version"],
                         success=result.status != "failed", task=True,
                         latency_ms=int((time.monotonic() - started) * 1000),
+                        operation_id=f"{session.session_id}:{session.skill_task_id}",
                     )
             return result
 
@@ -239,10 +240,13 @@ class StudioAgent:
         record_user_message: bool = True,
         resume_after_permission: bool = False,
         runtime_steer: bool = False,
+        submission_id: str | None = None,
     ) -> StudioSession:
         from veripatch import studio_skills
 
         previous_failure = session.failure_reason
+        if submission_id and any(m.message_id == submission_id for m in session.messages):
+            record_user_message = False
         user_message_recorded = False
         resume_words = {"继续", "继续吧", "继续执行", "重试", "resume", "continue"}
         bare_resume = user_message.strip().casefold() in resume_words
@@ -284,7 +288,8 @@ class StudioAgent:
         disabled = [name for name in requested if name not in explicit]
         if disabled:
             if record_user_message:
-                session.messages.append(StudioMessage(role="user", content=user_message))
+                session.messages.append(StudioMessage(role="user", content=user_message,
+                                                     message_id=submission_id))
             return self._pause(
                 session,
                 "指定技能尚未在本会话启用：" + "、".join(disabled)
@@ -354,7 +359,8 @@ class StudioAgent:
             )
             session.turn_required_language_suffix = self._required_language_suffix(user_message)
             if record_user_message:
-                session.messages.append(StudioMessage(role="user", content=user_message))
+                session.messages.append(StudioMessage(role="user", content=user_message,
+                                                     message_id=submission_id))
                 if session.title == "新编码任务":
                     session.title = user_message.strip().splitlines()[0][:80] or session.title
                 session.status = "running"
@@ -369,7 +375,8 @@ class StudioAgent:
                 session, session.task_contract, user_message
             )
         if record_user_message and not user_message_recorded:
-            session.messages.append(StudioMessage(role="user", content=user_message))
+            session.messages.append(StudioMessage(role="user", content=user_message,
+                                                 message_id=submission_id))
         self._refresh_context_summary(session)
         if record_user_message and session.title == "新编码任务":
             session.title = user_message.strip().splitlines()[0][:80] or session.title
@@ -523,6 +530,9 @@ class StudioAgent:
                 break
             steered = self.consume_steer() if self.consume_steer is not None else None
             if steered:
+                steer_id = None
+                if isinstance(steered, tuple):
+                    steered, steer_id = steered
                 self._record_steer_changes(session)
                 self.store.save(
                     session,
@@ -533,7 +543,9 @@ class StudioAgent:
                         "prior_changed_files": session.steer_prior_changed_files,
                     },
                 )
-                return await self.handle(session, steered, runtime_steer=True)
+                return await self.handle(
+                    session, steered, runtime_steer=True, submission_id=steer_id,
+                )
             # The repository can change during this loop; never send the model
             # the file tree captured before its own create/edit actions.
             files = _file_tree(workspace.root)
@@ -792,6 +804,9 @@ class StudioAgent:
                 return self._pause(session, "用户暂停了执行；尚未执行模型返回的动作。")
             steered = self.consume_steer() if self.consume_steer is not None else None
             if steered:
+                steer_id = None
+                if isinstance(steered, tuple):
+                    steered, steer_id = steered
                 self._record_steer_changes(session)
                 self.store.save(
                     session,
@@ -802,7 +817,9 @@ class StudioAgent:
                         "prior_changed_files": session.steer_prior_changed_files,
                     },
                 )
-                return await self.handle(session, steered, runtime_steer=True)
+                return await self.handle(
+                    session, steered, runtime_steer=True, submission_id=steer_id,
+                )
             self._normalize_workspace_decision_path(workspace, decision)
             session.activity = "executing_tool"
             self._apply_memory_update(session, decision)
@@ -1117,7 +1134,9 @@ class StudioAgent:
             actions=actions,
         )
         use_delete_batch = all(a.action is StudioAction.DELETE_PATH for a in actions) and not any(
-            a.call_id in session.tool_call_results for a in actions if a.call_id
+            a.call_id in session.tool_call_results
+            or self.store.operation(session.session_id, a.call_id)
+            for a in actions if a.call_id
         )
         # The delete fast path bypasses _execute_action for individual items.
         # Check explicit task prohibitions before asking for or using a grant.
@@ -1131,6 +1150,14 @@ class StudioAgent:
             self._request_action_approval(session, batch)
             return True
         if use_delete_batch:
+            for item in actions:
+                if item.call_id is None:
+                    item.call_id = uuid4().hex
+            if not self.store.claim_batch(session.session_id, [
+                (item.call_id, self._operation_digest(item, session)) for item in actions
+            ]):
+                self._pause(session, "批量操作已被其他执行者领取；请检查已有执行结果。")
+                return True
             paths = [a.path for a in actions if a.path is not None]
             grant = approval_fingerprint(batch)
             if grant in session.once_grants:
@@ -1155,6 +1182,7 @@ class StudioAgent:
                 deleted, failure = self.executor.delete_batch(session, workspace, paths)
             except Exception as exc:
                 for item in actions:
+                    self.store.operation_unknown(session.session_id, item.call_id)
                     session.tool_call_results[item.call_id] = {
                         "status": "completed", "output": {
                             "call_id": item.call_id, "status": "failed",
@@ -2408,12 +2436,22 @@ class StudioAgent:
             for index, child in enumerate(decision.actions):
                 if child.call_id is None:
                     child.call_id = f"{call_id}:{index}"
-        prior = session.tool_call_results.get(call_id)
+        try:
+            claimed, prior = self.store.claim_operation(
+                session.session_id, call_id, self._operation_digest(decision, session),
+                session.tool_call_results.get(call_id),
+                resume_pending=session.pending_permission is None,
+            )
+        except IdempotencyConflict as exc:
+            self._pause(session, str(exc))
+            return True
+        if prior and not claimed:
+            session.tool_call_results[call_id] = prior
         if prior and prior["status"] == "completed":
             return False
         if prior and prior["status"] == "pending" and session.pending_permission is not None:
             return True
-        if prior and prior["status"] == "running":
+        if not claimed and prior and prior["status"] in {"running", "unknown"}:
             self._pause(session, "工具调用的执行状态未确认；为避免重复副作用，请先检查执行结果。")
             return True
         session.tool_call_results[call_id] = {"status": "running"}
@@ -2431,11 +2469,17 @@ class StudioAgent:
             ),
         })
         start = len(session.observations)
-        terminal = self._execute_once(
-            session, workspace, decision, permission_checked=permission_checked
-        )
+        try:
+            terminal = self._execute_once(
+                session, workspace, decision, permission_checked=permission_checked
+            )
+        except BaseException:
+            self.store.operation_unknown(session.session_id, call_id)
+            raise
         interrupted = session.pending_permission is not None or (
             terminal and session.status == "paused"
+            and len(session.observations) == start
+            # A tool with committed evidence already ran, even if recovery paused.
             # A rejected completion was fully reviewed, not an unexecuted tool.
             # Its result must be available when the user continues the session.
             and decision.action not in {StudioAction.RESPOND, StudioAction.FINISH}
@@ -2455,6 +2499,32 @@ class StudioAgent:
         }
         self.store.save(session, "tool_call_state", {"call_id": call_id})
         return terminal
+
+    @staticmethod
+    def _operation_digest(decision: StudioDecision, session: StudioSession) -> str:
+        from veripatch import skill_runtime
+
+        def semantic(value: dict[str, Any]) -> dict[str, Any]:
+            result = {k: v for k, v in value.items()
+                      if k not in {"call_id", "rationale", "memory_update"}}
+            result["actions"] = [semantic(v) for v in value.get("actions", [])]
+            # Do not strip keys inside arbitrary MCP argument objects.
+            # Approval previews use effective strict commands and pinned paths.
+            if result.get("action") == "run_tests" and session.verification_mode == "strict":
+                result["command"] = session.test_command
+            if result.get("action") == "read" and result.get("path"):
+                result["path"] = skill_runtime.map_path(session, result["path"])
+            if result.get("command"):
+                command = []
+                for argument in result["command"]:
+                    mapped = skill_runtime.map_path(session, argument)
+                    if mapped == argument and "=" in argument:
+                        prefix, val = argument.split("=", 1)
+                        mapped = prefix + "=" + skill_runtime.map_path(session, val)
+                    command.append(mapped)
+                result["command"] = command
+            return result
+        return payload_digest(semantic(decision.model_dump(mode="json")))
 
     def _execute_once(
         self,
@@ -2687,6 +2757,7 @@ class StudioAgent:
                             skill_runtime.record(
                                 session.repo_root, name, version, success=exit_code == 0,
                                 latency_ms=int((time.monotonic() - skill_command_started) * 1000),
+                                operation_id=f"{session.session_id}:{decision.call_id}",
                             )
         if observation is None:
             observation = self.executor.process(

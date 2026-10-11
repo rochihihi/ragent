@@ -10,7 +10,6 @@ import shutil
 import sys
 import tempfile
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -36,7 +35,7 @@ from veripatch.studio_domain import (
 )
 from veripatch.studio_git import GitToolError, StudioGit
 from veripatch.studio_model import StudioProviderModel
-from veripatch.studio_store import StudioStore
+from veripatch.studio_store import IdempotencyConflict, StudioStore
 from veripatch.studio_tools import (
     TERMINALS as TERMINALS,  # Compatibility export; execution lives in the Agent.
 )
@@ -135,6 +134,8 @@ class _SkillBodyLimitedRoute(APIRoute):
 
 class StudioUserMessage(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
+    message_id: str | None = Field(default=None, min_length=1, max_length=128,
+                                   pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
 class UpdateStudioSession(BaseModel):
@@ -395,7 +396,6 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
     router = APIRouter(route_class=_SkillBodyLimitedRoute, lifespan=lifespan)
     store = StudioStore(settings.database_path)
     tasks: dict[str, asyncio.Task[None]] = {}
-    steer_queues: dict[str, deque[str]] = {}
     pause_signals: dict[str, Event] = {}
 
     # A process exit destroys in-memory tasks but persisted sessions used to remain
@@ -404,13 +404,14 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
     for interrupted in store.list_sessions():
         watcher.add(interrupted.repo_root)
         if interrupted.status == "running":
-            interrupted.status = "idle"
-            interrupted.activity = "idle"
+            interrupted.status = "paused"
+            interrupted.activity = "paused"
+            interrupted.pause_reason = "上次执行被中断；请继续任务，状态不明的工具不会自动重跑。"
             interrupted.failure_reason = None
             store.save(
                 interrupted,
                 "interrupted",
-                {"summary": "上次执行因应用关闭或重启而中断，可继续发送消息。"},
+                {"summary": interrupted.pause_reason},
             )
         elif interrupted.status == "waiting_permission" and interrupted.pending_permission is None:
             # Older builds could persist the approval before the approved command
@@ -1005,7 +1006,10 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
         continuation: bool = False,
         record_user_message: bool = True,
         resume_after_permission: bool = False,
+        submission_id: str | None = None,
     ) -> None:
+        if submission_id:
+            store.request_started(session.session_id, "message", submission_id)
         watcher.add(session.repo_root)
         model_settings = replace(
             settings,
@@ -1027,14 +1031,13 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                     session_id=session.session_id,
                     turn_observation_start=session.turn_observation_start,
                 )
-            queue = steer_queues.setdefault(session.session_id, deque())
             signal = pause_signals.setdefault(session.session_id, Event())
             agent = StudioAgent(
                 model,
                 store,
                 max_steps=None,
                 max_context_tokens=context_limit_for_model(session.provider, session.model),
-                consume_steer=lambda: queue.popleft() if queue else None,
+                consume_steer=lambda: store.next_steer(session.session_id),
                 pause_requested=signal.is_set,
             )
             await asyncio.to_thread(
@@ -1042,6 +1045,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                     session, content, continuation=continuation,
                     record_user_message=record_user_message,
                     resume_after_permission=resume_after_permission,
+                    submission_id=submission_id,
                 ))
             )
         except Exception as exc:
@@ -1051,12 +1055,58 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
         finally:
             tasks.pop(session.session_id, None)
             pause_signals.pop(session.session_id, None)
-            if not steer_queues.get(session.session_id):
-                steer_queues.pop(session.session_id, None)
+            for receipt in store.unfinished_requests(session.session_id):
+                recorded = any(m.message_id == receipt["request_id"] for m in session.messages)
+                if receipt["state"] == "started" and recorded:
+                    store.request_finished(
+                        session.session_id, receipt["kind"], receipt["request_id"],
+                    )
+            # A message can arrive after the last Agent boundary but before this
+            # worker releases its task slot. Drain that tail instead of leaving
+            # an accepted correction stranded forever. Pause/approval never
+            # dispatch automatically.
+            if session.status in {"idle", "completed", "failed"}:
+                tail = store.next_steer(session.session_id)
+                if tail:
+                    content, identity = tail
+                    store.save(session.model_copy(update={
+                        "status": "running", "activity": "preparing_context",
+                    }), "queued_run_requested", {"message_id": identity})
+                    tasks[session.session_id] = asyncio.create_task(execute(
+                        session, content, submission_id=identity,
+                    ), name=f"studio-{session.session_id}-queued")
 
     @router.post("/studio-api/sessions/{session_id}/permissions/{request_id}")
     async def decide_permission(
         session_id: str, request_id: str, request: PermissionDecision, http_request: Request,
+    ) -> dict[str, str]:
+        load_session(session_id)
+        dispatch: list[tuple[StudioSession, str]] = []
+        try:
+            with store.request_transaction(
+                session_id, "permission", request_id, request.model_dump(mode="json"),
+            ) as receipt:
+                if receipt.replayed:
+                    assert receipt.response is not None
+                    return receipt.response
+                receipt.response = apply_permission(session_id, request_id, request, http_request,
+                                                    dispatch)
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        # Only dispatch after state, grants and receipt have committed together.
+        if dispatch:
+            session, content = dispatch[0]
+            tasks[session_id] = asyncio.create_task(execute(
+                session, content, continuation=True, record_user_message=False,
+                resume_after_permission=True,
+            ), name=f"studio-{session_id}-permission")
+        store.request_finished(session_id, "permission", request_id)
+        assert receipt.response is not None
+        return receipt.response
+
+    def apply_permission(
+        session_id: str, request_id: str, request: PermissionDecision, http_request: Request,
+        dispatch: list[tuple[StudioSession, str]],
     ) -> dict[str, str]:
         session = load_session(session_id)
         pending = session.pending_permission
@@ -1083,17 +1133,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                 },
             )
             store.save(session, "permission_instruction", {"content": content})
-            task = asyncio.create_task(
-                execute(
-                    session,
-                    content,
-                    continuation=True,
-                    record_user_message=False,
-                    resume_after_permission=True,
-                ),
-                name=f"studio-{session_id}-permission-revision",
-            )
-            tasks[session_id] = task
+            dispatch.append((session, content))
             return {"status": "revising"}
         if request.approved:
             if pending.decision is not None:
@@ -1158,16 +1198,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                     "permission_approved",
                     {"request_id": request_id, "scope": request.scope},
                 )
-                tasks[session_id] = asyncio.create_task(
-                    execute(
-                        session,
-                        _latest_task_message(session),
-                        continuation=True,
-                        record_user_message=False,
-                        resume_after_permission=True,
-                    ),
-                    name=f"studio-{session_id}-permission",
-                )
+                dispatch.append((session, _latest_task_message(session)))
                 return {"status": "approved"}
             if pending.access == "execute" and pending.command:
                 # Legacy saved requests also resume through the Agent executor.
@@ -1200,11 +1231,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                 session.activity = "preparing_context"
                 store.save(session, "permission_approved",
                            {"request_id": request_id, "scope": request.scope})
-                tasks[session_id] = asyncio.create_task(
-                    execute(session, _latest_task_message(session), continuation=True,
-                            record_user_message=False, resume_after_permission=True),
-                    name=f"studio-{session_id}-permission",
-                )
+                dispatch.append((session, _latest_task_message(session)))
                 return {"status": "approved"}
             target = Path(pending.path).resolve()
             approved = str(target)
@@ -1245,17 +1272,7 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
                 "permission_approved",
                 {"path": approved, "access": pending.access},
             )
-            task = asyncio.create_task(
-                execute(
-                    session,
-                    _latest_task_message(session),
-                    continuation=True,
-                    record_user_message=False,
-                    resume_after_permission=True,
-                ),
-                name=f"studio-{session_id}-permission",
-            )
-            tasks[session_id] = task
+            dispatch.append((session, _latest_task_message(session)))
             return {"status": "approved"}
         session.status = "idle"
         session.activity = "idle"
@@ -1290,40 +1307,55 @@ def create_studio_router(settings: Settings, *, ui_token: str | None = None) -> 
         if session_id in tasks or session.status != "paused":
             raise HTTPException(status_code=409, detail="仅可继续已暂停的任务")
         content = _latest_task_message(session)
+        unfinished = store.unfinished_requests(session_id)
+        unrecorded = next((r for r in unfinished if r["kind"] == "message"
+                           and (r["response"]["status"] == "accepted" or r["state"] == "started")
+                           and not any(m.message_id == r["request_id"] for m in session.messages)), None)
+        if unrecorded:
+            content = unrecorded["payload"]["content"]
         session.status = "running"
         store.save(session, "resume_requested", {"summary": "从已保存的任务和证据继续。"})
         tasks[session_id] = asyncio.create_task(execute(
-            session, content, continuation=True, record_user_message=False,
+            session, content, continuation=unrecorded is None,
+            record_user_message=unrecorded is not None,
+            submission_id=unrecorded["request_id"] if unrecorded else None,
         ), name=f"studio-{session_id}")
         await asyncio.sleep(0)
         return {"status": "accepted"}
 
     @router.post("/studio-api/sessions/{session_id}/messages", status_code=202)
     async def send_message(session_id: str, request: StudioUserMessage) -> dict[str, str]:
-        session = load_session(session_id)
-        if session_id in tasks or session.status == "running":
-            queue = steer_queues.setdefault(session_id, deque())
-            queue.append(request.content)
-            store.append_event(
-                session_id,
-                "steer_queued",
-                {
-                    "summary": "运行中纠正已排队，将在当前安全边界应用。",
-                    "content": request.content,
-                    "queue_depth": len(queue),
-                },
-            )
-            return {"session_id": session_id, "status": "queued"}
-        if session.status == "waiting_permission":
-            raise HTTPException(status_code=409, detail="请先在权限对话框中拒绝或调整方案")
-        store.save(session.model_copy(update={
-            "status": "running", "activity": "preparing_context",
-        }), "run_requested", {"summary": "任务已提交后台执行。"})
-        task = asyncio.create_task(execute(session, request.content), name=f"studio-{session_id}")
-        tasks[session_id] = task
-        # Let the worker persist the user message and running state before the
-        # client performs its immediate post-submit refresh.
+        load_session(session_id)
+        identity = request.message_id or uuid4().hex
+        try:
+            with store.request_transaction(session_id, "message", identity,
+                                           {"content": request.content}) as receipt:
+                if receipt.replayed:
+                    assert receipt.response is not None
+                    return receipt.response
+                session = load_session(session_id)
+                if session_id in tasks or session.status == "running":
+                    store.append_event(session_id, "steer_queued", {
+                        "summary": "运行中纠正已排队，将在当前安全边界应用。",
+                        "content": request.content, "message_id": identity,
+                    })
+                    receipt.response = {"session_id": session_id, "status": "queued"}
+                else:
+                    if session.status == "waiting_permission":
+                        raise HTTPException(status_code=409, detail="请先在权限对话框中拒绝或调整方案")
+                    store.save(session.model_copy(update={
+                        "status": "running", "activity": "preparing_context",
+                    }), "run_requested", {"summary": "任务已提交后台执行。", "message_id": identity})
+                    receipt.response = {"session_id": session_id, "status": "accepted"}
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        assert receipt.response is not None
+        if receipt.response["status"] == "queued":
+            return receipt.response
+        tasks[session_id] = asyncio.create_task(execute(
+            session, request.content, submission_id=identity,
+        ), name=f"studio-{session_id}")
         await asyncio.sleep(0)
-        return {"session_id": session_id, "status": "accepted"}
+        return receipt.response
 
     return router

@@ -13,7 +13,8 @@
     "test:drag": "node scripts/verify-effort-drag.mjs",
     "test:trace": "node scripts/verify-event-summary.mjs",
     "test:permissions": "node scripts/verify-permission-actions.mjs",
-    "test:skills": "node scripts/verify-skills-ui.mjs"
+    "test:skills": "node scripts/verify-skills-ui.mjs",
+    "test:idempotency": "node scripts/verify-message-identity.mjs"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.0",

@@ -340,9 +340,38 @@ def _packaged_self_check(report_path: Path) -> int:
             # Exercise actual packaged ONNX DLLs, tokenizer and multilingual weights,
             # not just module presence. No live keys or network are used here.
             memory_check = _check_memory_model(root)
+            # Exercise the newly migrated SQLite ledger and packaged metrics
+            # module without a provider, user keys, or external commands.
+            from veripatch.skill_metrics import append_sample
+            from veripatch.studio_agent import StudioAgent
+            from veripatch.studio_domain import PermissionMode, StudioDecision
+            from veripatch.workspace import SafeWorkspace
+
+            store = StudioStore(db)
+            checked = store.load("check")
+            checked.permission_mode = PermissionMode.FULL
+            decision = StudioDecision(call_id="packaged-once", action="create",
+                                      rationale="check", path="once.txt", content="first")
+            agent = StudioAgent(None, store)
+            agent._execute(checked, SafeWorkspace(root), decision)
+            (root / "once.txt").write_text("external", encoding="utf-8")
+            agent._execute(store.load("check"), SafeWorkspace(root), decision)
+            if (root / "once.txt").read_text(encoding="utf-8") != "external":
+                raise RuntimeError("Packaged tool ledger repeated an effect")
+            metrics = root / "metric-check"
+            for _ in range(2):
+                samples = append_sample(metrics, "demo", "version", "samples", [],
+                                        success=True, latency_ms=1, operation_id="once")
+            if len(samples) != 1:
+                raise RuntimeError("Packaged skill metrics repeated a sample")
+            with store.request_transaction("check", "message", "receipt", {"content": "x"}) as r:
+                r.response = {"status": "accepted"}
+            with store.request_transaction("check", "message", "receipt", {"content": "x"}) as r:
+                if not r.replayed or r.response != {"status": "accepted"}:
+                    raise RuntimeError("Packaged message receipt failed")
         result = {"ok": True, "checks": ["vue_page", "vue_assets", "yaml_multiline",
                   "skill_preview", "skill_import", "skill_modes", "skill_backup_delete",
-                  memory_check]}
+                  memory_check, "tool_idempotency", "metric_idempotency", "message_receipts"]}
         code = 0
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

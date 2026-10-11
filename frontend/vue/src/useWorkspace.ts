@@ -1,5 +1,6 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from "vue";
 import { api, type Session, type Event, type Provider } from "../../src/api";
+import { MessageIdentity } from "../../src/messageIdentity";
 
 export const providers: Array<[Provider, string]> = [["deepseek", "DeepSeek"], ["openai_official", "OpenAI 官方"], ["openai", "中转站"]];
 export const efforts: Record<Provider, Array<[string, string]>> = {
@@ -15,10 +16,12 @@ export function useWorkspace() {
   const draft = ref(""), error = ref(""), sending = ref(false), busy = ref(false), pausePending = ref(false);
   const messages = ref<HTMLElement | null>(null), followLatest = ref(true);
   let revision = 0, disposed = false, timer: ReturnType<typeof setTimeout> | undefined;
+  const messageIdentity = new MessageIdentity();
   const changed = computed(() => new Set(active.value?.changed_files ?? []));
   const visibleMessages = computed(() => (active.value?.messages ?? []).filter((m, i, all) =>
     !m.content.startsWith("调整执行方案：") && !m.content.startsWith("关于当前待批准操作，请调整方案：") &&
-    (!i || m.content !== all[i - 1].content || m.role !== all[i - 1].role)));
+    (!i || m.content !== all[i - 1].content || m.role !== all[i - 1].role ||
+      (m.message_id && m.message_id !== all[i - 1].message_id))));
   const locked = computed(() => !active.value || ["running", "waiting_permission"].includes(active.value.status) || busy.value);
   async function perform<T>(fn: () => Promise<T>): Promise<T | undefined> {
     try { return await fn(); } catch (e) { error.value = (e as Error).message; }
@@ -55,9 +58,10 @@ export function useWorkspace() {
   async function send() {
     const id = activeId.value, content = draft.value.trim(), previous = active.value;
     if (!id || !content || sending.value || !previous || previous.status === "waiting_permission") return;
+    const messageId = messageIdentity.acquire(id, content);
     sending.value = true; ++revision; draft.value = ""; followLatest.value = true;
-    active.value = { ...previous, status: "running", activity: "preparing_context", messages: [...previous.messages, { role: "user", content }] };
-    try { await api.send(id, content); }
+    active.value = { ...previous, status: "running", activity: "preparing_context", messages: [...previous.messages, { role: "user", content, message_id: messageId }] };
+    try { await api.send(id, content, messageId); messageIdentity.acknowledge(id, messageId); }
     catch (e) { if (activeId.value === id) { active.value = previous; draft.value = content; error.value = (e as Error).message; } }
     finally { sending.value = false; await perform(refresh); }
   }

@@ -33,6 +33,7 @@ def required() -> None:
 def test_approved_tool_execution_does_not_keep_preparing_context(tmp_path, monkeypatch):
     required()
     store = Mock()
+    store.claim_operation.return_value = (True, None)
     agent = StudioAgent(Mock(), store)
     session = StudioSession(
         session_id="resume", repo_root=str(tmp_path), provider="openai_official",

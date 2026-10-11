@@ -527,8 +527,11 @@ def configure(
 
 
 def record(
-    project: str, name: str, version: str, *, success: bool, latency_ms: int, task: bool = False
+    project: str, name: str, version: str, *, success: bool, latency_ms: int,
+    task: bool = False, operation_id: str | None = None,
 ) -> None:
+    from veripatch.skill_metrics import append_sample
+
     with skills._LOCK:
         registry = _load(project)
         entry = registry["skills"].get(name)
@@ -536,10 +539,10 @@ def record(
             return
         record = entry["versions"][version]
         field = "tasks" if task else "samples"
-        record[field] = [
-            *record.get(field, []),
-            {"success": success, "latency_ms": latency_ms, "time": time.time()},
-        ][-100:]
+        record[field] = append_sample(
+            runtime_root(project), name, version, field, record.get(field, []),
+            success=success, latency_ms=latency_ms, operation_id=operation_id,
+        )
         samples = [
             s for s in record.get("samples", []) if s["time"] >= entry.get("evaluation_since", 0)
         ]

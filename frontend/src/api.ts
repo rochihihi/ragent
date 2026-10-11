@@ -1,6 +1,6 @@
 export type Provider = "deepseek" | "openai" | "openai_official";
 
-export type Message = { role: "user" | "assistant"; content: string };
+export type Message = { role: "user" | "assistant"; content: string; message_id?: string | null };
 export type Session = {
   session_id: string;
   title: string;
@@ -105,7 +105,7 @@ export const api = {
   fileChange: (id: string, path: string) => request<{ path: string; changed: boolean; before: string | null; after: string; diff: string }>(`/studio-api/sessions/${id}/file-change?path=${encodeURIComponent(path)}`),
   createSession: (body: object) => request<{ session_id: string }>("/studio-api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   deleteSession: (id: string) => request<void>(`/studio-api/sessions/${id}`, { method: "DELETE" }),
-  send: (id: string, content: string) => request<{ status: string }>(`/studio-api/sessions/${id}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content }) }),
+  send: (id: string, content: string, messageId: string = crypto.randomUUID()) => request<{ status: string }>(`/studio-api/sessions/${id}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content, message_id: messageId }) }),
   pause: (id: string) => request<{ status: string }>(`/studio-api/sessions/${id}/pause`, { method: "POST" }),
   resume: (id: string) => request<{ status: string }>(`/studio-api/sessions/${id}/resume`, { method: "POST" }),
   updateSettings: (id: string, body: object) => request<Session>(`/studio-api/sessions/${id}/settings`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),

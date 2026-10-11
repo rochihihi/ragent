@@ -448,6 +448,7 @@ class StudioDecision(BaseModel):
 class StudioMessage(BaseModel):
     role: str
     content: str
+    message_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
