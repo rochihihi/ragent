@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import sqlite3
@@ -258,6 +259,36 @@ def _wait_until_ready(url: str, timeout: float = 15.0) -> None:
     raise RuntimeError("VeriPatch local service did not start")
 
 
+def _check_memory_model(root: Path) -> str:
+    from veripatch.embedding_assets import model_directory
+    from veripatch.studio_domain import StudioSession
+    from veripatch.studio_embeddings import SemanticIndex, retrieve_memory
+    from veripatch.studio_memory import remember
+
+    if not getattr(sys, "frozen", False) and not (model_directory() / "tokenizer.json").is_file():
+        # Source checkouts need not download 135 MB to test the desktop bridge.
+        # Packaged builds MUST perform real offline semantic retrieval.
+        return "offline_memory_not_provisioned_in_source_checkout"
+    memory_session = StudioSession(
+        session_id="memory-check", repo_root=str(root), provider="deepseek",
+        model="test", reasoning_effort="low",
+    )
+    note = "访问令牌存储于操作系统的安全保险库。"
+    remember(memory_session, "facts", note, source="model_note")
+    for number in range(45):
+        remember(memory_session, "facts", f"已调整界面颜色 {number}", source="model_note")
+    index = SemanticIndex()
+    try:
+        projection = asyncio.run(retrieve_memory(
+            memory_session, "Where are authentication credentials kept?", index=index,
+        ))
+        if projection["retrieval_status"] != "hybrid_local" or projection["facts"][0] != note:
+            raise RuntimeError("Packaged offline semantic retrieval failed")
+    finally:
+        index._worker.shutdown(wait=True)
+    return "offline_multilingual_hybrid_memory"
+
+
 def _packaged_self_check(report_path: Path) -> int:
     """Check the built executable without a window, live credentials, or the desktop mutex."""
     import json
@@ -306,8 +337,12 @@ def _packaged_self_check(report_path: Path) -> int:
                                         params={"version": imported.json()["version"]})
                 if removed.status_code != 200:
                     raise RuntimeError("Packaged skill backup/delete unavailable")
+            # Exercise actual packaged ONNX DLLs, tokenizer and multilingual weights,
+            # not just module presence. No live keys or network are used here.
+            memory_check = _check_memory_model(root)
         result = {"ok": True, "checks": ["vue_page", "vue_assets", "yaml_multiline",
-                  "skill_preview", "skill_import", "skill_modes", "skill_backup_delete"]}
+                  "skill_preview", "skill_import", "skill_modes", "skill_backup_delete",
+                  memory_check]}
         code = 0
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

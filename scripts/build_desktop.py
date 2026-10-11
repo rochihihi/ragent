@@ -77,6 +77,8 @@ def verify_windows_helper(source: Path, patch: Path) -> None:
 
 
 def main() -> None:
+    from prepare_memory_model import prepare
+
     project = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist-dir", type=Path, default=project / "dist",
@@ -86,7 +88,11 @@ def main() -> None:
         raise SystemExit("缺少 MCP SDK。请先运行 `python -m pip install -e .`，再重新打包。")
     if importlib.util.find_spec("yaml") is None:
         raise SystemExit("缺少 PyYAML。请先运行 `python -m pip install -e .`，再重新打包。")
+    for dependency in ("numpy", "onnxruntime", "tokenizers"):
+        if importlib.util.find_spec(dependency) is None:
+            raise SystemExit(f"缺少 {dependency}；请先 python -m pip install -e .")
     sandbox = sandbox_assets(project)
+    memory_model = prepare(project / "build" / "memory-model")
     subprocess.run(["npm", "run", "build"], cwd=project / "frontend", check=True, shell=True)
     command = [
         sys.executable,
@@ -112,6 +118,12 @@ def main() -> None:
         f"{project / 'frontend' / 'dist'};frontend",
         "--add-data",
         f"{sandbox};sandbox/runtime",
+        "--add-data",
+        f"{memory_model};memory-model",
+        "--collect-all",
+        "onnxruntime",
+        "--collect-all",
+        "tokenizers",
         "--collect-all",
         "webview",
         "--collect-all",

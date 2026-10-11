@@ -16,6 +16,14 @@ def test_packaged_self_check_uses_isolated_state(tmp_path):
     assert json.loads(report.read_text(encoding="utf-8"))["ok"] is True
 
 
+def test_source_self_check_can_run_without_downloaded_model(tmp_path, monkeypatch):
+    from veripatch import embedding_assets
+    from veripatch.desktop import _check_memory_model
+
+    monkeypatch.setattr(embedding_assets, "model_directory", lambda: tmp_path / "missing")
+    assert _check_memory_model(tmp_path) == "offline_memory_not_provisioned_in_source_checkout"
+
+
 class FakeWindow:
     def __init__(self) -> None:
         self.calls: list[str] = []

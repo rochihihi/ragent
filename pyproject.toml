@@ -11,6 +11,9 @@ requires-python = ">=3.11"
 dependencies = [
   "PyYAML>=6,<7",
   "mcp>=1.20,<2",
+  "numpy==2.2.6",
+  "onnxruntime==1.24.4",
+  "tokenizers==0.22.2",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "keyring>=25,<27",
@@ -70,5 +73,5 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["keyring", "uvicorn", "webview"]
+module = ["keyring", "uvicorn", "webview", "onnxruntime", "tokenizers"]
 ignore_missing_imports = true

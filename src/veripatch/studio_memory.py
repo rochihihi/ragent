@@ -7,7 +7,9 @@ The original messages/observations remain the audit trail, even when notes are r
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from typing import Literal
 
 from veripatch.studio_domain import StudioMemoryEntry, StudioSession
@@ -99,24 +101,66 @@ def forget_model_note(session: StudioSession, category: Category, value: str) ->
     return True
 
 
-def _terms(text: str) -> set[str]:
+def _tokens(text: str) -> list[str]:
     normalized = text.casefold().replace("\\", "/")[:4_000]
-    terms = set(re.findall(r"[a-z0-9_][a-z0-9_.:/-]*", normalized))
+    terms = re.findall(r"[a-z0-9_][a-z0-9_.:/-]*", normalized)
     # No language-specific parser: include path components and Chinese bigrams.
-    terms.update(re.findall(r"[a-z0-9_]{2,}", normalized))
+    for word in list(terms):
+        if re.search(r"[.:/-]", word):
+            terms.extend(re.findall(r"[a-z0-9_]{2,}", word))
     for run in re.findall(r"[\u4e00-\u9fff]+", normalized):
-        terms.update(run[index:index + 2] for index in range(len(run) - 1))
+        terms.extend(run[index:index + 2] for index in range(len(run) - 1))
+        if len(run) == 1:
+            terms.append(run)
     return terms
+
+
+def bm25_scores(documents: list[str], query: str) -> list[float]:
+    """BM25 (k1=1.2, b=.75) over identifiers/path components and Chinese bigrams."""
+    counts = [Counter(_tokens(_clean(value))) for value in documents]
+    lengths = [sum(count.values()) for count in counts]
+    average = sum(lengths) / max(1, len(lengths)) or 1
+    frequency = Counter(term for count in counts for term in count)
+    scores = [0.0] * len(counts)
+    for term in set(_tokens(_clean(query))):
+        idf = math.log(1 + (len(counts) - frequency[term] + .5) / (frequency[term] + .5))
+        for index, count in enumerate(counts):
+            tf = count[term]
+            scores[index] += idf * tf * 2.2 / (tf + 1.2 * (.25 + .75 * lengths[index] / average))
+    return scores
+
+
+def fused_scores(
+    documents: list[str], query: str, semantic: list[float] | None = None,
+) -> list[float]:
+    """RRF over top 40 positive BM25 hits and top 40 cosine hits >= .25.
+
+    No mixing incompatible BM25/cosine magnitudes; zero matches add no RRF vote.
+    Recency only breaks equal scores in the projector, never grants authority.
+    """
+    lexical = bm25_scores(documents, query)
+    if semantic is None:
+        return lexical
+    if len(semantic) != len(documents) or not all(math.isfinite(v) for v in semantic):
+        raise ValueError("Invalid semantic scores")
+    result = [0.0] * len(documents)
+    for values, threshold in ((lexical, 0.0), (semantic, .25)):
+        hits = sorted(range(len(values)), key=lambda i: (values[i], i), reverse=True)
+        for rank, index in enumerate([i for i in hits if values[i] > threshold][:40], start=1):
+            result[index] += 1 / (60 + rank)
+    return result
 
 
 def project_memory(
     session: StudioSession, query: str = "", *, max_chars: int = 9_000,
+    semantic: list[float] | None = None, retrieval_status: str = "bm25_only",
 ) -> dict[str, object]:
     """Select relevant older notes as well as recent context, under a JSON character budget.
 
     Provenance arrays align with each category's selected notes. Selection never mutates
     the stored memory or performs cross-session reads. The char cap complements the
-    controller's provider-token budget; it is not a tokenizer or semantic search.
+    controller's provider-token budget; semantic scores must align with the current
+    category-ordered snapshot. The async retriever computes them locally.
     """
     if max_chars < 1_000:
         raise ValueError("Memory projection budget must be at least 1000 characters")
@@ -124,8 +168,9 @@ def project_memory(
         query = next(
             (item.content for item in reversed(session.messages) if item.role == "user"), ""
         )
-    query_terms = _terms(query)
     memory = session.memory
+    documents = [value for category in LIMITS for value in getattr(memory, category)]
+    scores = iter(fused_scores(documents, query, semantic))
     provenance = {(entry.category, entry.text): entry for entry in memory.entries}
     selected: dict[Category, list[str]] = {category: [] for category in LIMITS}
     sources: dict[Category, list[dict[str, object]]] = {category: [] for category in LIMITS}
@@ -140,7 +185,9 @@ def project_memory(
                               "Interpret against the original dialogue and latest corrections.",
         **{str(category): values for category, values in selected.items()},
         "provenance": sources,
-        "selection": "keyword relevance plus recency; bounded projection, full history retained",
+        "selection": "BM25 + local cosine / RRF; recency ties" if semantic is not None
+                     else "BM25; recency ties",
+        "retrieval_status": retrieval_status,
     }
 
     def fits() -> bool:
@@ -157,10 +204,10 @@ def project_memory(
             constraints.pop()
             break
 
-    candidates: dict[Category, list[tuple[int, int, str]]] = {}
+    candidates: dict[Category, list[tuple[float, int, str]]] = {}
     for category in LIMITS:
         candidates[category] = sorted(
-            ((len(query_terms & _terms(value)), index, value)
+            ((next(scores), index, value)
              for index, value in enumerate(getattr(memory, category))), reverse=True,
         )
 

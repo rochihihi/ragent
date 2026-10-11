@@ -39,6 +39,7 @@ from veripatch.studio_domain import (
     TaskVerificationPolicy,
     VerificationMode,
 )
+from veripatch.studio_embeddings import retrieve_memory
 from veripatch.studio_execution import (
     changed_launch_target,
     classify_command,
@@ -513,6 +514,7 @@ class StudioAgent:
         self.restore_verification_from_evidence(session)
 
         context_transform_recorded = False
+        memory_retrieval_recorded = ""
         for turn_step in count():
             await asyncio.sleep(0)
             if self.pause_requested and self.pause_requested():
@@ -540,6 +542,18 @@ class StudioAgent:
             completion_check = completion.assess(
                 session, self._validate_task_contract(session)
             )
+            memory_projection = await self._await_model(retrieve_memory(session, user_message))
+            memory_status = str(memory_projection["retrieval_status"])
+            if memory_status != memory_retrieval_recorded:
+                self.store.save(session, "memory_retrieval", {
+                    "summary": (
+                        "会话记忆：本地向量 + BM25 混合检索。"
+                        if memory_status == "hybrid_local" else
+                        "会话记忆：使用 BM25 检索；详见检索状态。"
+                    ),
+                    "retrieval_status": memory_status,
+                })
+                memory_retrieval_recorded = memory_status
             context: dict[str, object] = {
                 "mcp": {
                     "server": "User-configured external MCP servers only",
@@ -595,7 +609,7 @@ class StudioAgent:
                 ],
                 "current_request": user_message,
                 "conversation_summary": self._model_context_summary(session),
-                "structured_memory": self._model_memory(session, user_message),
+                "structured_memory": memory_projection,
                 "authority": {
                     "objective": user_message,
                     "allowed_actions": session.task_contract.allowed_actions
@@ -3631,7 +3645,7 @@ class StudioAgent:
             "task_contract": (
                 session.task_contract.model_dump(mode="json") if session.task_contract else None
             ),
-            "structured_memory": self._model_memory(
+            "structured_memory": context.get("structured_memory") or self._model_memory(
                 session, str(context.get("current_request", ""))
             ),
             "task_state": self._model_task_state(session),
