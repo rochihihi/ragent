@@ -84,18 +84,32 @@ class StudioPlanItem(BaseModel):
     note: str | None = None
 
 
+class StudioMemoryEntry(BaseModel):
+    """Provenance for a retained note, never authorization or live-state proof."""
+
+    category: Literal["facts", "hypotheses", "relevant_files", "failures"]
+    text: str = Field(max_length=500)
+    source: Literal["model_note", "tool_observation", "legacy"]
+    message_index: int | None = Field(default=None, ge=0)
+    observation_index: int | None = Field(default=None, ge=0)
+
+
 class StudioMemory(BaseModel):
     constraints: list[str] = Field(default_factory=list, max_length=40)
     facts: list[str] = Field(default_factory=list, max_length=80)
     hypotheses: list[str] = Field(default_factory=list, max_length=40)
     relevant_files: list[str] = Field(default_factory=list, max_length=80)
     failures: list[str] = Field(default_factory=list, max_length=40)
+    entries: list[StudioMemoryEntry] = Field(default_factory=list, max_length=240)
 
 
 class StudioMemoryUpdate(BaseModel):
     facts: list[str] = Field(default_factory=list, max_length=12)
     hypotheses: list[str] = Field(default_factory=list, max_length=12)
     relevant_files: list[str] = Field(default_factory=list, max_length=20)
+    # Exact withdrawals of model notes only; tool evidence and history are immutable here.
+    forget_facts: list[str] = Field(default_factory=list, max_length=12)
+    forget_hypotheses: list[str] = Field(default_factory=list, max_length=12)
 
 
 class StudioRequirement(BaseModel):

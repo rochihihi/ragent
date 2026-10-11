@@ -56,6 +56,13 @@ from veripatch.studio_intent import (
     model_intent_policy,
     requests_code_change,
 )
+from veripatch.studio_memory import (
+    Category,
+    forget_model_note,
+    project_memory,
+    redact_memory_text,
+    remember,
+)
 from veripatch.studio_permissions import fingerprint as approval_fingerprint
 from veripatch.studio_permissions import requires_approval, session_grant_matches
 from veripatch.studio_runtime import StudioExecutionRuntime
@@ -588,7 +595,7 @@ class StudioAgent:
                 ],
                 "current_request": user_message,
                 "conversation_summary": self._model_context_summary(session),
-                "structured_memory": self._model_memory(session),
+                "structured_memory": self._model_memory(session, user_message),
                 "authority": {
                     "objective": user_message,
                     "allowed_actions": session.task_contract.allowed_actions
@@ -2977,12 +2984,16 @@ class StudioAgent:
         update = decision.memory_update
         if update is None:
             return
+        for fact in update.forget_facts:
+            forget_model_note(session, "facts", fact)
+        for hypothesis in update.forget_hypotheses:
+            forget_model_note(session, "hypotheses", hypothesis)
         for fact in update.facts:
-            cls._remember_unique(session.memory.facts, fact, 80)
+            remember(session, "facts", fact, source="model_note")
         for hypothesis in update.hypotheses:
-            cls._remember_unique(session.memory.hypotheses, hypothesis, 40)
+            remember(session, "hypotheses", hypothesis, source="model_note")
         for path in update.relevant_files:
-            cls._remember_unique(session.memory.relevant_files, path, 80)
+            remember(session, "relevant_files", path, source="model_note")
 
     @classmethod
     def _learn_from_observation(
@@ -2993,6 +3004,17 @@ class StudioAgent:
     ) -> list[str]:
         changes: list[str] = []
         payload = observation.payload
+        observation_index = next(
+            (index for index in range(len(session.observations) - 1, -1, -1)
+             if session.observations[index] is observation), None,
+        )
+
+        def record(category: Category, value: str) -> bool:
+            return remember(
+                session, category, value, source="tool_observation",
+                observation_index=observation_index,
+            )
+
         paths: list[str] = []
         direct_path = payload.get("path")
         if isinstance(direct_path, str):
@@ -3005,10 +3027,17 @@ class StudioAgent:
                 if isinstance(item, dict) and isinstance(item.get("path"), str)
             )
         for path in paths:
-            if cls._remember_unique(session.memory.relevant_files, path, 80):
+            if record("relevant_files", path):
                 changes.append(f"相关文件 {path}")
 
         fact: str | None = None
+        status = ToolOutcome.normalize(action, observation).status
+        if status.value in {"failed", "blocked"} and action not in {
+            StudioAction.RUN_TESTS, StudioAction.RUN_COMMAND,
+        }:
+            if record("failures", observation.summary):
+                changes.append("记录失败证据")
+            return changes
         if action is StudioAction.READ and isinstance(direct_path, str):
             fact = f"已阅读 {direct_path}，共 {payload.get('total_lines', '?')} 行"
         elif action is StudioAction.SEARCH:
@@ -3020,16 +3049,29 @@ class StudioAgent:
         } and isinstance(direct_path, str):
             verb = "修改" if action in {StudioAction.EDIT, StudioAction.APPLY_PATCH} else "创建"
             fact = f"已{verb} {direct_path}"
-        elif action is StudioAction.RUN_COMMAND and payload.get("launch_state") in {
-            "dispatched", "running_unconfirmed",
-        }:
+        elif (
+            action is StudioAction.RUN_COMMAND
+            and status.value not in {"failed", "blocked"}
+            and payload.get("launch_state") in {"dispatched", "running_unconfirmed"}
+        ):
             fact = (
                 "系统已接受打开请求，未确认可见窗口"
                 if payload["launch_state"] == "dispatched"
                 else "程序仍在运行，未确认可见窗口；不得重复启动"
             )
         elif action in {StudioAction.RUN_TESTS, StudioAction.RUN_COMMAND}:
-            passed = payload.get("exit_code") == 0
+            if (
+                payload.get("exit_code") is None and not payload.get("timed_out")
+                and status.value not in {"failed", "blocked"}
+            ):
+                pending = "命令尚无退出结果，不能判断成功或失败；检查现有进程，不重复启动"
+                if record("facts", pending):
+                    changes.append("记录命令待完成状态")
+                return changes
+            passed = (
+                payload.get("exit_code") == 0 and not payload.get("timed_out")
+                and status.value not in {"failed", "blocked"}
+            )
             command = payload.get("command", [])
             rendered = " ".join(str(part) for part in command) if isinstance(command, list) else ""
             fact = f"验证 {'通过' if passed else '失败'}：{rendered}".strip()
@@ -3043,9 +3085,9 @@ class StudioAgent:
                 payload["next_strategy"] = strategy
                 payload["retryable"] = retryable
                 failure = f"{fact}；{tail}" if tail else fact
-                if cls._remember_unique(session.memory.failures, failure, 40):
+                if record("failures", failure):
                     changes.append("记录失败证据")
-        if fact and cls._remember_unique(session.memory.facts, fact, 80):
+        if fact and record("facts", fact):
             changes.append(fact)
         return changes
 
@@ -3415,7 +3457,7 @@ class StudioAgent:
             session.usage.model_calls += 1
             for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens"):
                 setattr(session.usage, key, getattr(session.usage, key) + int(result.get(key, 0)))
-            summary = result["summary"].strip()
+            summary = redact_memory_text(result["summary"].strip())
             if not summary or self._estimate_tokens(summary) > self.max_context_tokens // 4:
                 raise ValueError("Empty or oversized handoff summary")
             candidate = session.model_copy(deep=True)
@@ -3546,6 +3588,7 @@ class StudioAgent:
             "files",
             "recent_observations",
             "messages",
+            "structured_memory",
         ):
             if over_target() and key in context:
                 context.pop(key)
@@ -3588,7 +3631,9 @@ class StudioAgent:
             "task_contract": (
                 session.task_contract.model_dump(mode="json") if session.task_contract else None
             ),
-            "structured_memory": self._model_memory(session),
+            "structured_memory": self._model_memory(
+                session, str(context.get("current_request", ""))
+            ),
             "task_state": self._model_task_state(session),
             "plan": [item.model_dump(mode="json") for item in session.plan[-12:]],
             "changed_files": session.turn_changed_files,
@@ -3710,19 +3755,8 @@ class StudioAgent:
         }
 
     @classmethod
-    def _model_memory(cls, session: StudioSession) -> dict[str, Any]:
-        memory = session.memory
-        return {
-            "constraints": [cls._compact_value(item, 600) for item in memory.constraints[-20:]],
-            "constraints_status": (
-                "Legacy unverified notes, not active restrictions or approval. "
-                "Interpret against the original dialogue and latest corrections."
-            ),
-            "facts": [cls._compact_value(item, 600) for item in memory.facts[-30:]],
-            "hypotheses": [cls._compact_value(item, 600) for item in memory.hypotheses[-12:]],
-            "relevant_files": memory.relevant_files[-40:],
-            "failures": [cls._compact_value(item, 1_200) for item in memory.failures[-12:]],
-        }
+    def _model_memory(cls, session: StudioSession, query: str = "") -> dict[str, Any]:
+        return project_memory(session, query)
 
     @classmethod
     def _model_context_summary(cls, session: StudioSession) -> dict[str, Any]:
